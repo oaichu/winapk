@@ -86,7 +86,7 @@ fn adaptive_to_png(apk_path: &Path, xml: &[u8]) -> Option<Vec<u8>> {
             let path = ch
                 .attr("drawable")
                 .and_then(|a| a.ref_id)
-                .and_then(|r| table.resolve(r, true, 0))
+                .and_then(|r| table.resolve(r, true, 0, None))
                 .and_then(|v| match v {
                     ResValue::Str(s) => Some(s),
                     _ => None,

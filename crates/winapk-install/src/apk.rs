@@ -5,6 +5,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use winapk_core::error::{Error, Result};
+use winapk_core::warn;
 
 use crate::arsc::{ResTable, ResValue};
 use crate::axml::{self, AttrValue, Node};
@@ -91,7 +92,7 @@ pub fn analyze(apk: &Path) -> Result<ApkInfo> {
     // label: may be a string or @ref
     let app = m.children_named("application").next();
     let label = app
-        .and_then(|a| label_of(a, table.as_ref()))
+        .map(|a| label_of(a, table.as_ref(), &package))
         .unwrap_or_else(|| package.clone());
 
     // launcher activity: <activity> with MAIN + LAUNCHER intent-filter
@@ -231,17 +232,29 @@ fn qualify(pkg: &str, act: &str) -> String {
     }
 }
 
-fn label_of(app: &Node, table: Option<&ResTable>) -> Option<String> {
-    if let Some(r) = app.attr_ref("label") {
-        if let Some(t) = table {
-            if let Some(ResValue::Str(s)) = t.resolve(r, false, 0) {
-                return Some(s);
-            }
+/// Resolved app label. Prefers the `en` locale when the APK ships one;
+/// when the resolved name contains no ASCII at all (zh-only apps like
+/// PinyinIME ship just 谷歌拼音输入法), falls back to the package name so
+/// shortcuts/titles stay readable on an English-locale host.
+fn label_of(app: &Node, table: Option<&ResTable>, package: &str) -> String {
+    let resolved = app
+        .attr_ref("label")
+        .and_then(|r| table.and_then(|t| t.resolve(r, false, 0, Some("en"))))
+        .and_then(|v| match v {
+            ResValue::Str(s) => Some(s),
+            _ => None,
+        })
+        .or_else(|| match app.attr_value("label") {
+            Some(AttrValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        });
+    match resolved {
+        Some(s) if s.chars().any(|c| c.is_ascii_alphanumeric()) => s,
+        Some(s) => {
+            warn!("app label {s:?} has no ASCII name — falling back to package name");
+            package.to_string()
         }
-    }
-    match app.attr_value("label") {
-        Some(AttrValue::Str(s)) => Some(s.clone()),
-        _ => None,
+        None => package.to_string(),
     }
 }
 
@@ -249,7 +262,7 @@ fn icon_of(app: &Node, table: Option<&ResTable>) -> Option<String> {
     let a = app.attr("icon").or_else(|| app.attr("roundIcon"))?;
     if let Some(t) = table {
         if let Some(r) = a.ref_id {
-            if let Some(ResValue::Str(path)) = t.resolve(r, true, 0) {
+            if let Some(ResValue::Str(path)) = t.resolve(r, true, 0, None) {
                 if path.starts_with("res/") {
                     return Some(path);
                 }

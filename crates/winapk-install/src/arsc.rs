@@ -85,6 +85,61 @@ fn read_string_pool(buf: &[u8], start: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Diagnostic (ignored by default): dump every locale variant of the
+    /// app's label — answers "does this APK even ship an English name?"
+    /// Run: APK=path\to\app.apk cargo test -p winapk-install dump_label -- --ignored
+    #[test]
+    #[ignore]
+    fn dump_label_configs() {
+        use crate::axml::{self, AttrValue};
+        use std::io::Read;
+        let apk = std::env::var("APK").expect("set APK=<path>");
+        let f = std::fs::File::open(&apk).unwrap();
+        let mut z = zip::ZipArchive::new(std::io::BufReader::new(f)).unwrap();
+        let mut mbytes = Vec::new();
+        z.by_name("AndroidManifest.xml")
+            .unwrap()
+            .read_to_end(&mut mbytes)
+            .unwrap();
+        let doc = axml::parse_axml(&mbytes).unwrap();
+        let m = axml::manifest_root(&doc).unwrap();
+        let app = m.children_named("application").next().unwrap();
+        let label_ref = app.attr("label").and_then(|a| a.ref_id).unwrap();
+        eprintln!("label res id = {label_ref:#x}");
+        let mut rbytes = Vec::new();
+        z.by_name("resources.arsc")
+            .unwrap()
+            .read_to_end(&mut rbytes)
+            .unwrap();
+        let t = ResTable::parse(&rbytes).unwrap();
+        let type_id = ((label_ref >> 16) & 0xff) as u8;
+        let entry_idx = label_ref & 0xffff;
+        for p in &t.packages {
+            if let Some(chunks) = p.types.get(&type_id) {
+                for c in chunks {
+                    if let Some(v) = c.entries.get(&entry_idx) {
+                        let s = if v.data_type == TYPE_STRING {
+                            t.global_strings
+                                .get(v.data as usize)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            format!("<type {} data {:#x}>", v.data_type, v.data)
+                        };
+                        eprintln!(
+                            "  lang={:?} density={} sdk={} => {:?}",
+                            c.config.language, c.config.density, c.config.sdk, s
+                        );
+                    }
+                }
+            }
+        }
+        // also the raw string attr if present
+        if let Some(AttrValue::Str(s)) = app.attr_value("label") {
+            eprintln!("  raw manifest string: {s:?}");
+        }
+    }
+
     #[test]
     fn garbage_never_panics() {
         for len in [0usize, 1, 8, 12, 64, 512] {
@@ -140,8 +195,8 @@ fn parse_config(buf: &[u8], off: usize) -> Config {
 }
 
 /// Prefer `file` (highest density, avoid anydpi vectors) or `string`
-/// (default config over localized).
-fn score(c: &Config, prefer_file: bool) -> i64 {
+/// (preferred locale > default config > other locales).
+fn score(c: &Config, prefer_file: bool, prefer_lang: Option<&str>) -> i64 {
     if prefer_file {
         let mut s = c.density as i64;
         if c.density == 0xfffe {
@@ -151,6 +206,11 @@ fn score(c: &Config, prefer_file: bool) -> i64 {
     } else {
         let mut s = 0i64;
         s -= if c.density == 0 { 0 } else { 10 };
+        if let Some(want) = prefer_lang {
+            if c.language == want {
+                s += 60; // explicit user/host preference wins
+            }
+        }
         if !c.language.is_empty() {
             s -= 40;
         }
@@ -308,8 +368,15 @@ impl ResTable {
     }
 
     /// Resolve a `0xPPTTEEEE` reference. `prefer_file` scores configs for
-    /// image density; false scores for plain (default-config) strings.
-    pub fn resolve(&self, r: u32, prefer_file: bool, depth: u8) -> Option<ResValue> {
+    /// image density; false scores for strings — `prefer_lang` (e.g.
+    /// "en") ranks that locale above the default config when both exist.
+    pub fn resolve(
+        &self,
+        r: u32,
+        prefer_file: bool,
+        depth: u8,
+        prefer_lang: Option<&str>,
+    ) -> Option<ResValue> {
         if depth > 6 || r == 0 {
             return None;
         }
@@ -328,7 +395,7 @@ impl ResTable {
         let mut best_score = i64::MIN;
         for c in chunks {
             if let Some(v) = c.entries.get(&entry_idx) {
-                let s = score(&c.config, prefer_file);
+                let s = score(&c.config, prefer_file, prefer_lang);
                 if s > best_score {
                     best_score = s;
                     best = Some(*v);
@@ -342,7 +409,7 @@ impl ResTable {
                 .get(v.data as usize)
                 .cloned()
                 .map(ResValue::Str),
-            TYPE_REFERENCE => self.resolve(v.data, prefer_file, depth + 1),
+            TYPE_REFERENCE => self.resolve(v.data, prefer_file, depth + 1, prefer_lang),
             TYPE_INT_BOOLEAN => Some(ResValue::Bool(v.data != 0)),
             TYPE_INT_DEC | TYPE_INT_HEX => Some(ResValue::Int(v.data as i64)),
             _ => None,
