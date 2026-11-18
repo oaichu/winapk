@@ -1,0 +1,14 @@
+WINapk
+======
+
+WINapk is a from-scratch re-implementation inspired by and forked from the
+architecture of ApkStart (https://github.com/RoutineMiku/apkstart),
+Copyright (c) RoutineMiku, distributed under the MIT License.
+
+Binary-XML (AXML) and resource-table (ARSC) parsing logic in
+crates/winapk-install was ported to Rust from apkstart's
+src/core/axml.js and src/core/arsc.js (MIT License).
+
+The upstream project's UX model — "one Android app = one clean Windows
+window, double-click .apk to install" — is preserved; the engine,
+orchestrator, display host and host/guest channels are new code.

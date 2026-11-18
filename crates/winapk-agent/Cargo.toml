@@ -1,0 +1,12 @@
+[package]
+name = "winapk-agent"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+# android-only bits live behind cfg; the protocol core compiles anywhere.

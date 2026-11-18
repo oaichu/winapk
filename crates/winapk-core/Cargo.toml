@@ -1,0 +1,13 @@
+[package]
+name = "winapk-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+windows = { workspace = true }

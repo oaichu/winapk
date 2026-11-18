@@ -1,0 +1,5 @@
+/target
+/native/winapk-display-host/bin/
+/native/winapk-display-host/obj/
+*.o
+*.exe.tmp

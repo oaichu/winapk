@@ -1,0 +1,12 @@
+[package]
+name = "winapk-display"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+winapk-core = { path = "../winapk-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+windows = { workspace = true }

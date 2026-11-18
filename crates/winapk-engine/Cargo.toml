@@ -1,0 +1,15 @@
+[package]
+name = "winapk-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+winapk-core = { path = "../winapk-core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+winreg.workspace = true
+windows = { workspace = true }

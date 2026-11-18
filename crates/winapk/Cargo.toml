@@ -1,0 +1,22 @@
+[package]
+name = "winapk"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "winapk"
+path = "src/main.rs"
+
+[dependencies]
+winapk-core = { path = "../winapk-core" }
+winapk-engine = { path = "../winapk-engine" }
+winapk-install = { path = "../winapk-install" }
+winapk-display = { path = "../winapk-display" }
+winapk-share = { path = "../winapk-share" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+winreg.workspace = true
