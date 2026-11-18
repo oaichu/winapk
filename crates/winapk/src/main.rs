@@ -195,6 +195,7 @@ fn run(cli: Cli) -> winapk_core::Result<()> {
                 crop,
                 width: config.window.portrait_w,
                 height: config.window.portrait_h,
+                title_hint: engine.window_title_hint(),
             };
             match winapk_display::attach(&paths, &req, &pkg)? {
                 Some(mut host) => {

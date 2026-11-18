@@ -531,6 +531,17 @@ impl Engine {
         self.child.as_ref().map(|c| c.id())
     }
 
+    /// Substring of the emulator's main Qt window title ("WINapk:5554")
+    /// — the display host matches on this instead of picking the
+    /// process's largest window (Extended Controls is bigger).
+    pub fn window_title_hint(&self) -> Option<String> {
+        let port = self.serial.trim_start_matches("emulator-");
+        if port.is_empty() {
+            return None;
+        }
+        Some(format!("{}:{}", avd::AVD_NAME, port))
+    }
+
     /// Apply the Win32 tuning layer to a live emulator pid.
     fn tune_process(&self, pid: u32) {
         if self.config.engine.no_ecoqos && tuning::disarm_power_throttling(pid) {

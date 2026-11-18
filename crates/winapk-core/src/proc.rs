@@ -283,6 +283,68 @@ pub fn acquire_named_mutex(_name: &str) -> Option<()> {
     None
 }
 
+/// Pids of processes named `<name_prefix>*` among the descendants of
+/// `root_pid`. The emulator launcher re-execs: the Qt window and the
+/// real QEMU live in a `qemu-system-*.exe` DESCENDANT, not in the pid
+/// we spawned — display-host embedding must target that pid.
+#[cfg(windows)]
+pub fn descendants_named(root_pid: u32, name_prefix: &str) -> Vec<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let mut e = PROCESSENTRY32W::default();
+        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut rows: Vec<(u32, u32, String)> = Vec::new();
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let name = String::from_utf16_lossy(
+                    &e.szExeFile[..e
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(e.szExeFile.len())],
+                );
+                rows.push((e.th32ProcessID, e.th32ParentProcessID, name));
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        let prefix = name_prefix.to_ascii_lowercase();
+        let mut out = Vec::new();
+        for (pid, ppid, name) in &rows {
+            if !name.to_ascii_lowercase().starts_with(&prefix) {
+                continue;
+            }
+            let mut cur = *ppid;
+            for _ in 0..8 {
+                if cur == root_pid {
+                    out.push(*pid);
+                    break;
+                }
+                match rows.iter().find(|r| r.0 == cur) {
+                    Some(r) => cur = r.1,
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+pub fn descendants_named(_root_pid: u32, _name_prefix: &str) -> Vec<u32> {
+    Vec::new()
+}
+
 /// __vmd keeper body: wrap `pid`'s tree in a kill-on-close job, then
 /// block until the watched process exits. Our exit closes the job
 /// handle → the kernel reaps any still-running descendants.

@@ -29,6 +29,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cwchar>
+#include <cwctype>
 #include <vector>
 
 #include "present.h"
@@ -43,6 +45,7 @@ struct Opts {
     DWORD emuPid = 0;
     wchar_t title[256] = L"WINapk";
     wchar_t icon[MAX_PATH] = {0};
+    wchar_t match[256] = {0};
     int w = 540, h = 960;
     bool hasCrop = false;
     int cropL = 0, cropT = 0, cropR = 0, cropB = 0;
@@ -60,26 +63,71 @@ static HICON loadIcon(const Opts &o) {
     return LoadIconW(NULL, IDI_APPLICATION);
 }
 
-// ---- find the emulator's top-level window for a given pid ----
-struct FindCtx { DWORD pid; HWND best; DWORD bestArea; };
+static bool containsNoCase(const wchar_t *hay, const wchar_t *needle) {
+    if (!needle[0]) return true;
+    for (const wchar_t *p = hay; *p; p++) {
+        int i = 0;
+        while (needle[i] && towlower(p[i]) == towlower(needle[i])) i++;
+        if (!needle[i]) return true;
+    }
+    return false;
+}
+
+// ---- find the emulator's MAIN LCD window for a given pid ----
+// The qemu process owns several visible Qt windows ("Android Emulator -
+// WINapk:5554", "Extended Controls - WINapk:5554", a sidebar tool window
+// and possibly a console). Largest-area alone picks Extended Controls —
+// so: require the icon-frame class, exclude Extended Controls, prefer a
+// title containing --match, then largest area.
+static const wchar_t *CLASS_TOKEN = L"QWindowIcon";
+static bool isExcludedTitle(const wchar_t *t) {
+    return wcsncmp(t, L"Extended Controls", 17) == 0;
+}
+struct FindCtx { DWORD pid; const wchar_t *match; HWND best; DWORD bestArea; HWND hintBest; };
 static BOOL CALLBACK enumEmu(HWND h, LPARAM lp) {
     FindCtx *c = (FindCtx *)lp;
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+    wchar_t cls[128] = {0}, title[256] = {0};
+    GetClassNameW(h, cls, 128);
+    GetWindowTextW(h, title, 256);
+    if (!wcsstr(cls, CLASS_TOKEN)) return TRUE;      // skip console/tool windows
+    if (isExcludedTitle(title)) return TRUE;
+    if (!title[0]) return TRUE;
     RECT r; GetWindowRect(h, &r);
     DWORD area = (DWORD)((r.right - r.left) * (r.bottom - r.top));
     if (area > c->bestArea) { c->bestArea = area; c->best = h; }
+    if (c->match[0] && containsNoCase(title, c->match)) c->hintBest = h;
     return TRUE;
 }
-static HWND findEmuWindow(DWORD pid, DWORD timeoutMs) {
-    FindCtx c{pid, NULL, 0};
+static BOOL CALLBACK hideToolWindows(HWND h, LPARAM lp) {
+    // FindCtx::pid via ctx; hide floating Qt tool windows (sidebar) that
+    // belong to the emulator but aren't the embedded LCD surface.
+    FindCtx *c = (FindCtx *)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+    if (h == c->best) return TRUE;          // keep the embedded LCD
+    wchar_t cls[128] = {0};
+    GetClassNameW(h, cls, 128);
+    if (wcsstr(cls, L"QWindow")) ShowWindow(h, SW_HIDE);
+    return TRUE;
+}
+
+static HWND findEmuWindow(DWORD pid, const wchar_t *match, DWORD timeoutMs) {
+    FindCtx c{pid, match, NULL, 0, NULL};
     DWORD t0 = GetTickCount();
-    while (!c.best && GetTickCount() - t0 < timeoutMs) {
+    // Enumerate at least ONCE even with timeoutMs=0 — a plain while-loop
+    // skips the body entirely, silently returning NULL forever (the bug
+    // that made every embedded window a blank white surface).
+    do {
         EnumWindows(enumEmu, (LPARAM)&c);
-        if (!c.best) Sleep(150);
-    }
-    return c.best;
+        if (c.hintBest) break;
+        if (GetTickCount() - t0 >= timeoutMs) break;
+        Sleep(150);
+    } while (!c.hintBest);
+    return c.hintBest ? c.hintBest : c.best;
 }
 
 struct Host {
@@ -88,6 +136,10 @@ struct Host {
     HWND emu = NULL;
     SIZE lcd = {0, 0};   // emulator LCD size, captured pre-reparent
     int titlebar = 0;
+    // Original window styles of the emulator LCD, restored on handback —
+    // leaving it WS_CHILD with no parent kills its GL surface for good.
+    LONG emuStyle = 0;
+    LONG emuExStyle = 0;
     Presenter *presenter = nullptr;
 };
 
@@ -127,10 +179,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == FIT_TIMER && h) {
             if (h->emu && !IsWindow(h->emu)) h->emu = NULL;
             if (!h->emu) {
-                h->emu = findEmuWindow(h->o.emuPid, 0);
+                h->emu = findEmuWindow(h->o.emuPid, h->o.match, 0);
                 if (h->emu) {
                     RECT r; GetClientRect(h->emu, &r);
                     h->lcd.cx = r.right; h->lcd.cy = r.bottom;
+                    h->emuStyle = GetWindowLongW(h->emu, GWL_STYLE);
+                    h->emuExStyle = GetWindowLongW(h->emu, GWL_EXSTYLE);
                     SetParent(h->emu, hwnd);
                     LONG st = GetWindowLongW(h->emu, GWL_STYLE);
                     st &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU |
@@ -139,6 +193,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SetWindowLongW(h->emu, GWL_STYLE, st);
                     LONG ex = GetWindowLongW(h->emu, GWL_EXSTYLE);
                     SetWindowLongW(h->emu, GWL_EXSTYLE, ex & ~WS_EX_APPWINDOW);
+                    // The sidebar/toolbar floats above everything after the
+                    // LCD moved under us — hide remaining Qt tool windows.
+                    FindCtx hx{h->o.emuPid, h->o.match, h->emu, 0, NULL};
+                    EnumWindows(hideToolWindows, (LPARAM)&hx);
                 }
             }
             fitChild(h);
@@ -174,9 +232,15 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         if (h && h->emu && IsWindow(h->emu)) {
-            // Hand the emulator window back to the desktop so a host crash
-            // never orphans a WS_CHILD emulator surface.
+            // Hand the emulator window back to the desktop, restoring its
+            // original top-level styles — a WS_CHILD window without a
+            // parent renders nothing (its GL surface never recovers).
             SetParent(h->emu, NULL);
+            SetWindowLongW(h->emu, GWL_STYLE, h->emuStyle);
+            SetWindowLongW(h->emu, GWL_EXSTYLE, h->emuExStyle);
+            SetWindowPos(h->emu, NULL, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
         KillTimer(hwnd, FIT_TIMER);
         KillTimer(hwnd, DEAD_TIMER);
@@ -202,6 +266,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         auto next = [&](const wchar_t *d) -> LPWSTR { return i + 1 < argc ? argv[++i] : (LPWSTR)d; };
         if (!wcscmp(argv[i], L"--pid")) o.emuPid = (DWORD)_wtoi(next(L"0"));
         else if (!wcscmp(argv[i], L"--title")) wcsncpy_s(o.title, next(L""), 255);
+        else if (!wcscmp(argv[i], L"--match")) wcsncpy_s(o.match, next(L""), 255);
         else if (!wcscmp(argv[i], L"--icon")) wcsncpy_s(o.icon, next(L""), MAX_PATH - 1);
         else if (!wcscmp(argv[i], L"--size")) swscanf(next(L""), L"%dx%d", &o.w, &o.h);
         else if (!wcscmp(argv[i], L"--crop")) {

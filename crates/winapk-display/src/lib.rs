@@ -16,7 +16,8 @@ use winapk_core::{info, proc, warn};
 
 #[derive(Debug, Clone)]
 pub struct DisplayRequest {
-    /// Emulator process id — the host finds its top-level window.
+    /// Emulator LAUNCHER process id — resolved to the real qemu-system
+    /// descendant here, because that's the process owning the Qt window.
     pub emulator_pid: u32,
     pub title: String,
     pub ico: Option<PathBuf>,
@@ -26,6 +27,10 @@ pub struct DisplayRequest {
     /// Initial window size (host px).
     pub width: u32,
     pub height: u32,
+    /// Substring of the emulator's main Qt window title, e.g.
+    /// "WINapk:5554" — disambiguates it from "Extended Controls" and
+    /// tool windows owned by the same process.
+    pub title_hint: Option<String>,
 }
 
 pub struct DisplayHost {
@@ -55,17 +60,25 @@ pub fn attach(paths: &Paths, req: &DisplayRequest, pkg: &str) -> Result<Option<D
         warn!("winapk-display-host.exe not found — leaving emulator window standalone");
         return Ok(None);
     };
+    // The launcher pid owns no window (emulator.exe re-execs) — target
+    // the qemu-system descendant that actually owns the Qt window.
+    let emu_pid = proc::descendants_named(req.emulator_pid, "qemu-system")
+        .pop()
+        .unwrap_or(req.emulator_pid);
     let mut c = std::process::Command::new(exe);
-    c.arg("--pid").arg(req.emulator_pid.to_string())
+    c.arg("--pid").arg(emu_pid.to_string())
         .arg("--title").arg(&req.title)
         .arg("--size").arg(format!("{}x{}", req.width, req.height));
+    if let Some(hint) = &req.title_hint {
+        c.arg("--match").arg(hint);
+    }
     if let Some(ico) = &req.ico {
         c.arg("--icon").arg(ico);
     }
     if let Some((l, t, r, b)) = req.crop {
         c.arg("--crop").arg(format!("{l},{t},{r},{b}"));
     }
-    info!("display host attach pid={} title={:?}", req.emulator_pid, req.title);
+    info!("display host attach pid={emu_pid} title={:?} match={:?}", req.title, req.title_hint);
     let child = proc::spawn_quiet(&mut c)?;
     let _ = pkg;
     Ok(Some(DisplayHost {
