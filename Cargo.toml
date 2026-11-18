@@ -14,7 +14,7 @@ members = [
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
-repository = "https://github.com/RoutineMiku/apkstart" # fork lineage, see NOTICE
+repository = "https://github.com/oaichu/winapk" # fork lineage: RoutineMiku/apkstart, see NOTICE
 
 [workspace.dependencies]
 anyhow = "1"
