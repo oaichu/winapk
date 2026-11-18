@@ -28,6 +28,29 @@ struct Entry {
     mtime: u64,
 }
 
+/// POSIX single-quote for guest `sh -c` strings. `'` itself becomes
+/// `'\''` (close, escaped quote, reopen) so a host filename containing
+/// a quote can't break out of the quoted context.
+fn sq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Reject guest-provided relative paths that could escape the share dir:
+/// absolute/prefix components, `..`, Windows drive/UNC separators.
+fn safe_rel(rel: &str) -> Option<std::path::PathBuf> {
+    if rel.is_empty() || rel.contains('\\') || rel.contains(':') {
+        return None;
+    }
+    let p = Path::new(rel);
+    if !p
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(p.to_path_buf())
+}
+
 fn scan(dir: &Path) -> BTreeMap<String, Entry> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -35,7 +58,9 @@ fn scan(dir: &Path) -> BTreeMap<String, Entry> {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() {
+            // file_type() does NOT follow symlinks — a symlinked dir can't
+            // send the walker outside `dir` or into a cycle.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
                 continue;
             }
@@ -86,10 +111,7 @@ pub fn push(adb: &Adb, paths: &Paths) -> Result<usize> {
         let src = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
         let dst = format!("{GUEST_DIR}/{rel}");
         if let Some(d) = dst.rfind('/') {
-            let _ = adb.shell(
-                &format!("mkdir -p '{}'", &dst[..d]),
-                Duration::from_secs(10),
-            );
+            let _ = adb.shell(&format!("mkdir -p {}", sq(&dst[..d])), Duration::from_secs(10));
         }
         adb.run(
             &["push", &src.to_string_lossy(), &dst],
@@ -118,15 +140,30 @@ pub fn pull(adb: &Adb, paths: &Paths) -> Result<usize> {
     let mut got = 0usize;
     for line in out.lines() {
         let rel = line.trim().trim_start_matches("./");
-        if rel.is_empty() {
+        let Some(rel_path) = safe_rel(rel) else {
+            if !rel.is_empty() {
+                warn!("share pull: skipping unsafe guest path {rel:?}");
+            }
+            continue;
+        };
+        let dest = dir.join(&rel_path);
+        // Defense in depth: the join must stay inside the share dir.
+        if !dest.starts_with(&dir) {
+            warn!("share pull: rejecting escaping path {rel:?}");
             continue;
         }
-        let dest = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        // A symlinked dest on the host would let adb pull write outside
+        // the share dir through the link target.
+        if dest
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            warn!("share pull: refusing to write through symlink {rel:?}");
+            continue;
+        }
         let remote = format!("{GUEST_DIR}/{rel}");
-        let (_, sz) = adb.try_shell(
-            &format!("stat -c %s '{remote}'"),
-            Duration::from_secs(10),
-        );
+        let (_, sz) = adb.try_shell(&format!("stat -c %s {}", sq(&remote)), Duration::from_secs(10));
         let sz: u64 = sz.trim().parse().unwrap_or(0);
         let stale = dest.metadata().map(|m| m.len() != sz).unwrap_or(true);
         if !stale {
@@ -142,4 +179,34 @@ pub fn pull(adb: &Adb, paths: &Paths) -> Result<usize> {
     }
     info!("share pull: {got} file(s)");
     Ok(got)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_rel_rejects_escapes() {
+        assert!(safe_rel("../evil").is_none());
+        assert!(safe_rel("a/../../evil").is_none());
+        assert!(safe_rel("/abs/path").is_none());
+        assert!(safe_rel("a\\b").is_none());
+        assert!(safe_rel("C:x").is_none());
+        assert!(safe_rel("").is_none());
+        assert!(safe_rel("..").is_none());
+    }
+
+    #[test]
+    fn safe_rel_accepts_normal_paths() {
+        assert!(safe_rel("file.txt").is_some());
+        assert!(safe_rel("sub/dir/file.txt").is_some());
+        assert!(safe_rel("a//b").is_some());
+        assert!(safe_rel("weird 'name'.txt").is_some());
+    }
+
+    #[test]
+    fn sq_escapes_quotes() {
+        assert_eq!(sq("plain"), "'plain'");
+        assert_eq!(sq("it's"), "'it'\\''s'");
+    }
 }

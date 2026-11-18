@@ -77,8 +77,8 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
     let blocks_per_group = blocks.min(8 * BLOCK);
 
     let mut inodes_total = (blocks / 4).max(256);
-    inodes_total = (inodes_total + 7) / 8 * 8;
-    let itable_blocks = (inodes_total * INODE_SIZE + BLOCK - 1) / BLOCK;
+    inodes_total = inodes_total.div_ceil(8) * 8;
+    let itable_blocks = (inodes_total * INODE_SIZE).div_ceil(BLOCK);
 
     let gd_block = 1usize;
     let bb_block = 2usize;
@@ -101,9 +101,23 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
     let mut next_ino = FIRST_INO as u32;
 
     for f in files {
+        // Structural limits of this minimal writer: only 12 direct
+        // blocks per inode (48KiB max seed) and single-block dir entries
+        // (name ≤255B, all entries must fit 4KiB). Violating either
+        // would silently corrupt the image, so fail loudly instead.
+        assert!(
+            f.data.len() <= 12 * BLOCK,
+            "seed file {} is {}B > {}B direct-block limit",
+            f.path,
+            f.data.len(),
+            12 * BLOCK
+        );
         let parts: Vec<&str> = f.path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
             continue;
+        }
+        for p in &parts {
+            assert!(p.len() <= 255, "seed path component >255B: {p}");
         }
         let mut parent = 0usize; // index of root node
         for (depth, part) in parts.iter().enumerate() {
@@ -150,8 +164,8 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
 
     // ---- assign data blocks: one block per dir + ceil(size/BLOCK) per file ----
     for n in nodes.iter_mut() {
-        if n.data.is_some() {
-            let need = n.data.as_ref().unwrap().len().div_ceil(BLOCK).max(1) as u32;
+        if let Some(d) = &n.data {
+            let need = d.len().div_ceil(BLOCK).max(1) as u32;
             n.data_block = next_free_block;
             next_free_block += need;
         } else {
@@ -170,7 +184,7 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
     let sb = 1024usize;
 
     // ---- superblock ----
-    p32(&mut buf, sb + 0x00, inodes_total as u32);
+    p32(&mut buf, sb, inodes_total as u32);
     p32(&mut buf, sb + 0x04, blocks as u32);
     p32(&mut buf, sb + 0x08, (blocks as f64 * 0.05) as u32);
     p32(&mut buf, sb + 0x0C, (blocks - used_blocks) as u32);
@@ -220,7 +234,7 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
     // ---- group descriptor (block 1) ----
     let dir_count = nodes.iter().filter(|n| n.data.is_none()).count() as u16;
     let gd = gd_block * BLOCK;
-    p32(&mut buf, gd + 0x00, bb_block as u32);
+    p32(&mut buf, gd, bb_block as u32);
     p32(&mut buf, gd + 0x04, ib_block as u32);
     p32(&mut buf, gd + 0x08, itable_block as u32);
     p16(&mut buf, gd + 0x0C, (blocks_per_group - used_blocks) as u16);
@@ -264,11 +278,15 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
         off += 12;
         for (i, c) in children.iter().enumerate() {
             let last = i == children.len() - 1;
-            let rec = if last {
-                BLOCK - (off - base)
-            } else {
-                (8 + c.name.len() + 3) & !3
-            };
+            let need = (8 + c.name.len() + 3) & !3;
+            // All entries must fit the single directory block — the
+            // rec-length underflow / OOB write would corrupt the image.
+            assert!(
+                off + need <= base + BLOCK,
+                "dir block overflow seeding {} children",
+                children.len()
+            );
+            let rec = if last { BLOCK - (off - base) } else { need };
             let ftype = if c.is_dir { 2 } else { 1 };
             put(buf, c.ino, &c.name, ftype, rec, off);
             off += rec;
@@ -283,7 +301,7 @@ pub fn build_seed_ext4(size_mb: u32, encrypt: bool, files: &[SeedFile]) -> Vec<u
         } else {
             1
         };
-        p16(&mut buf, r + 0x00, n.mode);
+        p16(&mut buf, r, n.mode);
         p16(&mut buf, r + 0x02, n.uid);
         let (size, nblk) = match &n.data {
             Some(d) => (d.len() as u32, d.len().div_ceil(BLOCK).max(1) as u32),
@@ -406,6 +424,32 @@ pub fn mark_sparse(file: &Path) {
     }
 }
 
+/// Filesystem's own capacity in bytes (image file size can lie — the FS
+/// may not have grown into it).
+pub fn fs_bytes(file: &Path) -> u64 {
+    let Ok(mut f) = File::open(file) else {
+        return 0;
+    };
+    let mut sb = [0u8; 2048];
+    if f.read(&mut sb).unwrap_or(0) < 2048 {
+        return 0;
+    }
+    if u16::from_le_bytes([sb[1024 + 0x38], sb[1024 + 0x39]]) != 0xEF53 {
+        return 0;
+    }
+    let blocks_lo = u32::from_le_bytes([
+        sb[1024 + 4],
+        sb[1024 + 5],
+        sb[1024 + 6],
+        sb[1024 + 7],
+    ]) as u64;
+    let log_block =
+        u32::from_le_bytes([sb[1024 + 0x18], sb[1024 + 0x19], sb[1024 + 0x1A], sb[1024 + 0x1B]])
+            & 0xffff;
+    let block_size = 1024u64 << log_block;
+    blocks_lo * block_size
+}
+
 #[cfg(not(windows))]
 pub fn mark_sparse(_file: &Path) {}
 
@@ -436,30 +480,4 @@ mod tests {
         };
         std::fs::write(&out, build_seed_ext4(64, false, &files)).unwrap();
     }
-}
-
-/// Filesystem's own capacity in bytes (image file size can lie — the FS
-/// may not have grown into it).
-pub fn fs_bytes(file: &Path) -> u64 {
-    let Ok(mut f) = File::open(file) else {
-        return 0;
-    };
-    let mut sb = [0u8; 2048];
-    if f.read(&mut sb).unwrap_or(0) < 2048 {
-        return 0;
-    }
-    if u16::from_le_bytes([sb[1024 + 0x38], sb[1024 + 0x39]]) != 0xEF53 {
-        return 0;
-    }
-    let blocks_lo = u32::from_le_bytes([
-        sb[1024 + 4],
-        sb[1024 + 5],
-        sb[1024 + 6],
-        sb[1024 + 7],
-    ]) as u64;
-    let log_block =
-        u32::from_le_bytes([sb[1024 + 0x18], sb[1024 + 0x19], sb[1024 + 0x1A], sb[1024 + 0x1B]])
-            & 0xffff;
-    let block_size = 1024u64 << log_block;
-    blocks_lo * block_size
 }

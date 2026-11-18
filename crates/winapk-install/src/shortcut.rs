@@ -74,25 +74,25 @@ pub fn assoc_on(winapk_exe: &Path) -> Result<()> {
     let exe = winapk_exe.to_string_lossy().replace('/', "\\");
 
     let (k, _) = hkcu
-        .create_subkey(&classes_key(".apk"))
+        .create_subkey(classes_key(".apk"))
         .map_err(|e| Error::Apk(format!("reg .apk: {e}")))?;
     k.set_value("", &"WINapk.ApkFile")
         .map_err(|e| Error::Apk(format!("reg .apk set: {e}")))?;
 
     let (k, _) = hkcu
-        .create_subkey(&classes_key("WINapk.ApkFile"))
+        .create_subkey(classes_key("WINapk.ApkFile"))
         .map_err(|e| Error::Apk(format!("reg progid: {e}")))?;
     k.set_value("", &"Android Package (WINapk)")
         .map_err(|e| Error::Apk(format!("reg progid set: {e}")))?;
 
     let (k, _) = hkcu
-        .create_subkey(&classes_key("WINapk.ApkFile\\DefaultIcon"))
+        .create_subkey(classes_key("WINapk.ApkFile\\DefaultIcon"))
         .map_err(|e| Error::Apk(format!("reg icon: {e}")))?;
     k.set_value("", &format!("{exe},0"))
         .map_err(|e| Error::Apk(format!("reg icon set: {e}")))?;
 
     let (k, _) = hkcu
-        .create_subkey(&classes_key("WINapk.ApkFile\\shell\\open\\command"))
+        .create_subkey(classes_key("WINapk.ApkFile\\shell\\open\\command"))
         .map_err(|e| Error::Apk(format!("reg cmd: {e}")))?;
     k.set_value("", &format!("\"{exe}\" install \"%1\""))
         .map_err(|e| Error::Apk(format!("reg cmd set: {e}")))?;
@@ -103,9 +103,9 @@ pub fn assoc_off() -> Result<()> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let _ = hkcu.delete_subkey_all(&classes_key("WINapk.ApkFile"));
+    let _ = hkcu.delete_subkey_all(classes_key("WINapk.ApkFile"));
     if let Ok(k) = hkcu.open_subkey_with_flags(
-        &classes_key(".apk"),
+        classes_key(".apk"),
         winreg::enums::KEY_SET_VALUE,
     ) {
         let cur: String = k.get_value("").unwrap_or_default();

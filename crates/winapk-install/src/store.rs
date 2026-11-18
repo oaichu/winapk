@@ -30,11 +30,15 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// Atomic save: tmp+rename so a crash mid-write can't leave a
+    /// truncated store.json that reads back as "no apps installed".
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn upsert(&mut self, rec: AppRecord) {

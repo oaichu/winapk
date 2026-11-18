@@ -11,24 +11,45 @@ use crate::error::{Error, Result};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-/// Run to completion, capture stdout+stderr, no window.
+/// Run to completion, capture stdout+stderr, no window. The pipes are
+/// drained on threads while we poll: a child writing more than the pipe
+/// buffer before exiting would block on write and deadlock try_wait
+/// (taskkill/powershell chatter is enough to hit this on slow boots).
 pub fn run(cmd: &mut Command, timeout: Option<Duration>) -> Result<Output> {
     cmd.creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    match timeout {
-        None => Ok(child.wait_with_output()?),
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        if let Some(mut p) = stdout {
+            let _ = std::io::Read::read_to_end(&mut p, &mut v);
+        }
+        v
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        if let Some(mut p) = stderr {
+            let _ = std::io::Read::read_to_end(&mut p, &mut v);
+        }
+        v
+    });
+    let status = match timeout {
+        None => child.wait()?,
         Some(t) => {
             let deadline = Instant::now() + t;
             loop {
-                if let Some(_status) = child.try_wait()? {
-                    return child.wait_with_output().map_err(Into::into);
+                if let Some(s) = child.try_wait()? {
+                    break s;
                 }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = t_out.join();
+                    let _ = t_err.join();
                     return Err(Error::Timeout(format!(
                         "process did not exit within {t:?}"
                     )));
@@ -36,7 +57,12 @@ pub fn run(cmd: &mut Command, timeout: Option<Duration>) -> Result<Output> {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-    }
+    };
+    Ok(Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    })
 }
 
 /// Spawn a long-lived child detached from our console, stdio to null.
@@ -136,6 +162,26 @@ pub fn curl_download(url: &str, dest: &std::path::Path, timeout: Duration) -> Re
 
 pub fn stdout_string(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Full command line of `pid` — proves a candidate emulator belongs to
+/// OUR AVD (tag + console port) before adopt/stop, so we never grab or
+/// kill somebody else's emulator sharing the default serial range.
+#[cfg(windows)]
+pub fn process_cmdline(pid: u32) -> Option<String> {
+    let script =
+        format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine");
+    let mut c = Command::new("powershell");
+    c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    run(&mut c, Some(Duration::from_secs(15)))
+        .ok()
+        .map(|o| stdout_string(&o))
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(windows))]
+pub fn process_cmdline(_pid: u32) -> Option<String> {
+    None
 }
 
 /// A Windows Job Object configured JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.

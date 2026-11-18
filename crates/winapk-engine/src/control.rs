@@ -58,29 +58,43 @@ pub trait ControlChannel: Send {
     fn name(&self) -> &'static str;
 }
 
-/// virtio-serial socket channel (needs agent in guest).
+/// virtio-serial socket channel (needs agent in guest). The reader is
+/// persistent across calls: a fresh BufReader per call can buffer reply
+/// bytes it never returns, desyncing the request/reply framing for every
+/// subsequent command.
 pub struct VirtioSerialChannel {
     port: u16,
     stream: Option<TcpStream>,
+    reader: Option<BufReader<TcpStream>>,
 }
 
 impl VirtioSerialChannel {
     pub fn new(port: u16) -> Self {
-        Self { port, stream: None }
+        Self {
+            port,
+            stream: None,
+            reader: None,
+        }
     }
 
-    fn stream(&mut self) -> Result<&mut TcpStream> {
+    fn drop_conn(&mut self) {
+        self.stream = None;
+        self.reader = None;
+    }
+
+    fn ensure_conn(&mut self) -> Result<()> {
         if self.stream.is_none() {
             let s = TcpStream::connect_timeout(
-                &format!("127.0.0.1:{}", self.port).parse().unwrap(),
+                &std::net::SocketAddr::from(([127, 0, 0, 1], self.port)),
                 Duration::from_secs(3),
             )
             .map_err(|e| Error::Emulator(format!("virtio-serial connect: {e}")))?;
             s.set_read_timeout(Some(Duration::from_secs(10))).ok();
             s.set_write_timeout(Some(Duration::from_secs(10))).ok();
+            self.reader = Some(BufReader::new(s.try_clone()?));
             self.stream = Some(s);
         }
-        Ok(self.stream.as_mut().unwrap())
+        Ok(())
     }
 }
 
@@ -90,22 +104,46 @@ impl ControlChannel for VirtioSerialChannel {
     }
 
     fn call(&mut self, cmd: &AgentCmd, _timeout: Duration) -> Result<AgentMsg> {
-        let line = serde_json::to_string(cmd).unwrap();
-        {
-            let s = self.stream()?;
-            if s.write_all(line.as_bytes()).and_then(|_| s.write_all(b"\n")).is_err() {
-                self.stream = None;
-                return Err(Error::Emulator("agent channel write".into()));
+        self.ensure_conn()?;
+        let line = serde_json::to_string(cmd)
+            .map_err(|e| Error::Emulator(format!("agent cmd encode: {e}")))?;
+        let w = self
+            .stream
+            .as_mut()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .and_then(|_| self.stream.as_mut().unwrap().write_all(b"\n"));
+        if w.is_err() {
+            self.drop_conn();
+            return Err(Error::Emulator("agent channel write".into()));
+        }
+        // Read lines until a *reply* arrives — async AppExit events can be
+        // interleaved on the same stream and must not be consumed as (or
+        // mistaken for) the reply.
+        let reader = self.reader.as_mut().unwrap();
+        for _ in 0..8 {
+            let mut buf = String::new();
+            if let Err(e) = reader.read_line(&mut buf) {
+                self.drop_conn();
+                return Err(Error::Emulator(format!("agent read: {e}")));
+            }
+            if buf.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<AgentMsg>(buf.trim()) {
+                Ok(AgentMsg::AppExit { pkg }) => {
+                    winapk_core::info!("agent event: app exited {pkg}");
+                    continue;
+                }
+                Ok(msg) => return Ok(msg),
+                Err(e) => {
+                    return Err(Error::Emulator(format!(
+                        "agent msg parse: {e} ({buf})"
+                    )))
+                }
             }
         }
-        let s = self.stream()?;
-        let mut reader = BufReader::new(s.try_clone()?);
-        let mut buf = String::new();
-        reader
-            .read_line(&mut buf)
-            .map_err(|e| Error::Emulator(format!("agent read: {e}")))?;
-        serde_json::from_str(buf.trim())
-            .map_err(|e| Error::Emulator(format!("agent msg parse: {e} ({buf})")))
+        Err(Error::Emulator("agent reply: event flood".into()))
     }
 }
 
@@ -149,11 +187,10 @@ impl ControlChannel for AdbChannel {
                 op: "watch-adb-poll".into(),
             }),
             AgentCmd::ClipboardSet { text } => {
+                // POSIX-escape instead of stripping quotes — 'x' → 'x'\'''.
+                let esc = text.replace('\'', "'\\''");
                 self.adb.shell(
-                    &format!(
-                        "am broadcast -a clipper.set -e text '{}'",
-                        text.replace('\'', "")
-                    ),
+                    &format!("am broadcast -a clipper.set -e text '{esc}'"),
                     timeout,
                 )?;
                 Ok(AgentMsg::Ok { op: "clip".into() })

@@ -33,9 +33,12 @@ pub struct ApkInfo {
 }
 
 fn read_entry<R: Read + Seek>(z: &mut zip::ZipArchive<R>, name: &str) -> Result<Vec<u8>> {
-    let mut f = z.by_name(name).map_err(|e| Error::Apk(format!("{name}: {e}")))?;
-    let mut b = Vec::with_capacity(f.size() as usize);
-    f.read_to_end(&mut b)?;
+    const MAX_ENTRY: u64 = 256 * 1024 * 1024; // manifest/arsc are small;
+    let f = z.by_name(name).map_err(|e| Error::Apk(format!("{name}: {e}")))?;
+    // The zip-reported size is attacker-controlled — cap the buffer both
+    // in preallocation (can't OOM on a 4GB claim) and in actual reads.
+    let mut b = Vec::with_capacity((f.size() as usize).min(64 << 20));
+    f.take(MAX_ENTRY).read_to_end(&mut b)?;
     Ok(b)
 }
 
@@ -58,6 +61,20 @@ pub fn analyze(apk: &Path) -> Result<ApkInfo> {
             _ => None,
         })
         .ok_or_else(|| Error::Apk("manifest missing package".into()))?;
+
+    // The package name lands in shell commands (am force-stop, pm path,
+    // AOT compile). Reject anything outside the Java-package charset —
+    // a crafted manifest can't smuggle metacharacters downstream.
+    if package.is_empty()
+        || package.len() > 256
+        || !package
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    {
+        return Err(Error::Apk(format!(
+            "manifest package name has invalid characters: {package:?}"
+        )));
+    }
 
     let version_code = m.attr_value("versionCode").and_then(|v| match v {
         AttrValue::Int(i) => Some(*i),
@@ -153,8 +170,11 @@ pub fn analyze(apk: &Path) -> Result<ApkInfo> {
         .map(|v| !matches!(v, AttrValue::Bool(false)))
         .unwrap_or(true);
 
-    let min_sdk = app
-        .and_then(|a| a.children_named("uses-sdk").next())
+    // <uses-sdk> is a child of <manifest>, not <application> — the old
+    // lookup under `app` could never find it (min_sdk was always None).
+    let min_sdk = m
+        .children_named("uses-sdk")
+        .next()
         .and_then(|u| u.attr_value("minSdkVersion").cloned())
         .and_then(|v| match v {
             AttrValue::Int(i) => Some(i),

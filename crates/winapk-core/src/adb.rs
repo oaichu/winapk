@@ -264,9 +264,7 @@ impl Adb {
         if !ok {
             return None;
         }
-        out.lines()
-            .filter(|l| l.contains('/'))
-            .last()
+        out.lines().rfind(|l| l.contains('/'))
             .map(|l| l.trim().to_string())
     }
 

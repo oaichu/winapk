@@ -164,7 +164,7 @@ pub fn fallback_ico(pkg: &str) -> Vec<u8> {
     // XOR pixels bottom-up: two rounded-rect tones
     for y in 0..SZ {
         for x in 0..SZ {
-            let inner = x >= 4 && x < SZ - 4 && y >= 4 && y < SZ - 4;
+            let inner = (4..SZ - 4).contains(&x) && (4..SZ - 4).contains(&y);
             let (cr, cg, cb) = if inner {
                 (r, g, bl)
             } else {
@@ -174,7 +174,7 @@ pub fn fallback_ico(pkg: &str) -> Vec<u8> {
         }
     }
     // AND mask: all opaque (rows padded to 32-bit → SZ*1bpp = 4 bytes/row)
-    bmp.extend(std::iter::repeat(0u8).take(SZ * 4));
+    bmp.extend(std::iter::repeat_n(0u8, SZ * 4));
 
     let mut ico = Vec::with_capacity(22 + bmp.len());
     ico.extend_from_slice(&[0, 0, 1, 0, 1, 0]);

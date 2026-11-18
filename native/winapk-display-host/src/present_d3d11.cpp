@@ -31,6 +31,9 @@ struct Presenter {
     bool testPattern = false;
     std::atomic<bool> quit{false};
     std::thread worker;
+    // The D3D11 immediate context is single-threaded — worker Map/Copy
+    // vs UI-thread ClearState/ResizeBuffers must serialize or it's UB.
+    SRWLOCK ctxLock = SRWLOCK_INIT;
 };
 
 static bool initD3D(Presenter *p) {
@@ -76,9 +79,12 @@ static bool ensureStage(Presenter *p, UINT w, UINT hgt) {
 }
 
 static void presentFrame(Presenter *p, const UINT8 *pixels, UINT w, UINT hgt, UINT stride) {
-    if (!ensureStage(p, w, hgt)) return;
+    AcquireSRWLockExclusive(&p->ctxLock);
+    if (!ensureStage(p, w, hgt)) { ReleaseSRWLockExclusive(&p->ctxLock); return; }
     D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(p->ctx->Map(p->stage, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    if (FAILED(p->ctx->Map(p->stage, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        ReleaseSRWLockExclusive(&p->ctxLock); return;
+    }
     for (UINT y = 0; y < hgt; y++) {
         memcpy((UINT8 *)m.pData + y * m.RowPitch, pixels + y * stride, w * 4);
     }
@@ -90,6 +96,7 @@ static void presentFrame(Presenter *p, const UINT8 *pixels, UINT w, UINT hgt, UI
         bb->Release();
         p->swap->Present(1, 0);
     }
+    ReleaseSRWLockExclusive(&p->ctxLock);
 }
 
 // Synthetic BGRA frame — animates so a frozen pipeline is obvious.
@@ -122,8 +129,13 @@ static void workerMain(Presenter *p) {
         UINT64 seq = p->hdr->seq;
         if (seq == lastSeq) { Sleep(4); continue; }
         lastSeq = seq;
+        // Producer-written fields get a sanity clamp before indexing —
+        // a corrupt header can't send memcpy out of the mapped view.
+        UINT fw = p->hdr->width, fh = p->hdr->height, fs = p->hdr->stride;
+        if (!fw || !fh || fw > 8192 || fh > 8192 || fs < fw * 4 ||
+            (UINT64)fs * fh > (1ULL << 31)) continue;
         const UINT8 *px = (const UINT8 *)p->hdr + sizeof(FrameHeader);
-        presentFrame(p, px, p->hdr->width, p->hdr->height, p->hdr->stride);
+        presentFrame(p, px, fw, fh, fs);
     }
 }
 
@@ -144,8 +156,10 @@ Presenter *presenterCreate(HWND hwnd, const wchar_t *shmName, bool testPattern) 
 
 void presenterResize(Presenter *p, UINT w, UINT h) {
     if (!p || !p->swap || w == 0 || h == 0) return;
+    AcquireSRWLockExclusive(&p->ctxLock);
     p->ctx->ClearState();
     p->swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    ReleaseSRWLockExclusive(&p->ctxLock);
 }
 
 void presenterDestroy(Presenter *p) {

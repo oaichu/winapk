@@ -145,9 +145,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == DEAD_TIMER && h && h->o.emuPid) {
             HANDLE pr = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, h->o.emuPid);
             DWORD code = 0;
+            // Only kill our window on PROOF of death — a transient
+            // OpenProcess failure (ACL, pid reuse race) shouldn't make
+            // the app window vanish under the user.
             BOOL dead = pr && GetExitCodeProcess(pr, &code) && code != STILL_ACTIVE;
             if (pr) CloseHandle(pr);
-            if (dead || !pr) DestroyWindow(hwnd);
+            if (dead) DestroyWindow(hwnd);
         }
         return 0;
     case WM_SIZE:
@@ -249,5 +252,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         DispatchMessageW(&m);
     }
     if (h.presenter) presenterDestroy(h.presenter);
+    if (argv) LocalFree(argv);
     return (int)m.wParam;
 }

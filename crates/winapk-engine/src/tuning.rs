@@ -305,8 +305,10 @@ fn qemu_pids_under(launcher_pid: u32) -> Vec<u32> {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let mut e = PROCESSENTRY32W::default();
-        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut e = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut rows: Vec<(u32, u32, String)> = Vec::new();
         if Process32FirstW(snap, &mut e).is_ok() {
             loop {
@@ -361,8 +363,10 @@ fn pin_existing_threads(pid: u32, ids: &[u32]) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut te = THREADENTRY32::default();
-        te.dwSize = size_of::<THREADENTRY32>() as u32;
+        let mut te = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
         if Thread32First(snap, &mut te).is_ok() {
             loop {
                 if te.th32OwnerProcessID == pid {

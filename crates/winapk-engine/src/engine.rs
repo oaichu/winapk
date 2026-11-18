@@ -130,7 +130,7 @@ impl Engine {
         const HOST_GROW_CAP: u64 = 8 * 1024 * 1024 * 1024;
         let img = self.paths.avd_dir().join("userdata-qemu.img");
         let want_bytes: u64 = self.config.engine.userdata_gb.max(1) as u64 * (1024 * 1024 * 1024);
-        let fs_target = want_bytes.min(HOST_GROW_CAP).max(64 * 1024 * 1024);
+        let fs_target = want_bytes.clamp(64 * 1024 * 1024, HOST_GROW_CAP);
         let size = std::fs::metadata(&img).map(|m| m.len()).unwrap_or(0);
 
         if size > 0 && userdata::has_ext4_superblock(&img) {
@@ -292,6 +292,29 @@ impl Engine {
             Some(p) if proc::pid_alive(p) => p,
             _ => return Ok(false),
         };
+        // The pid file can hold a dead pid that the OS already reused —
+        // alive-but-not-ours would make us adopt a foreign emulator (and
+        // later taskkill an innocent process). Prove the pid's cmdline
+        // carries our AVD tag, and pin adoption to the serial derived
+        // from ITS -port flag so a foreign emulator running alongside
+        // is never claimed (emu kill would murder the user's VM).
+        let Some(cmdline) = proc::process_cmdline(pid) else {
+            warn!("emulator.pid {pid}: cmdline unreadable — dropping stale pid file");
+            let _ = std::fs::remove_file(self.paths.root().join("emulator.pid"));
+            return Ok(false);
+        };
+        if !cmdline.contains(avd::AVD_NAME) {
+            warn!("emulator.pid {pid} is not a WINapk emulator — dropping stale pid file");
+            let _ = std::fs::remove_file(self.paths.root().join("emulator.pid"));
+            return Ok(false);
+        }
+        let want_serial: Option<String> = {
+            let toks: Vec<&str> = cmdline.split_whitespace().collect();
+            toks.iter()
+                .position(|t| *t == "-port")
+                .and_then(|i| toks.get(i + 1))
+                .map(|p| format!("emulator-{p}"))
+        };
         let exe = self.paths.adb_exe();
         if !exe.exists() {
             return Ok(false);
@@ -301,6 +324,13 @@ impl Engine {
         for serial in probe.devices()? {
             if !serial.starts_with("emulator-") {
                 continue;
+            }
+            // Only adopt the serial our own -port flag produced; when it
+            // can't be derived, refuse rather than guess at a foreign VM.
+            match &want_serial {
+                Some(w) if serial != *w => continue,
+                None => continue,
+                _ => {}
             }
             let c = Adb::new(self.paths.adb_exe(), self.config.engine.adb_port)
                 .for_serial(&serial);
@@ -790,7 +820,12 @@ impl Engine {
             return Box::new(vs);
         }
         info!("control channel: adb fallback");
-        Box::new(AdbChannel::new(self.adb_client().unwrap()))
+        match self.adb_client() {
+            Ok(a) => Box::new(AdbChannel::new(a)),
+            // adb.exe missing is no reason to panic — the virtio channel
+            // stays usable and calls surface their own errors.
+            Err(_) => Box::new(vs),
+        }
     }
 
     // ---------- app sessions ----------
@@ -868,10 +903,16 @@ impl Engine {
             }
             if let Some(p) = pid {
                 std::thread::sleep(Duration::from_secs(6));
-                if proc::pid_alive(p) {
+                let ours = proc::process_cmdline(p)
+                    .map(|c| c.contains(avd::AVD_NAME))
+                    .unwrap_or(false);
+                if proc::pid_alive(p) && ours {
                     proc::kill_tree(p);
                 }
             }
+            // The launcher can die while its detached QEMU survives —
+            // same sweep the owned-path uses.
+            proc::kill_emulator_orphans(&format!("@{}", avd::AVD_NAME));
             let _ = std::fs::remove_file(self.paths.root().join("emulator.pid"));
             self.state = VmState::Off;
             tuning::prevent_sleep(false);

@@ -86,12 +86,28 @@ impl Node {
     }
 }
 
+// Total readers: out-of-bounds yields 0 instead of panicking — a
+// malformed/crafted manifest degrades to "wrong values" (chunk types
+// become unknown → skipped, counts become 0) rather than crashing the
+// CLI on every truncated APK it sees.
 fn u16le(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
+    u16::from_le_bytes(
+        b.get(o..o + 2)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 2]),
+    )
 }
 fn u32le(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    u32::from_le_bytes(
+        b.get(o..o + 4)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 4]),
+    )
 }
+
+const MAX_STRINGS: usize = 1 << 20; // sanity cap on string-pool count
+const MAX_STR_LEN: usize = 1 << 20; // per-string char cap
+const MAX_DEPTH: usize = 64; // element nesting cap (find_all recurses)
 
 fn read_string_pool(buf: &[u8], start: usize) -> Result<(Vec<String>, usize)> {
     if u16le(buf, start) != RES_STRING_POOL_TYPE {
@@ -104,27 +120,31 @@ fn read_string_pool(buf: &[u8], start: usize) -> Result<(Vec<String>, usize)> {
     let strings_start = u32le(buf, start + 20) as usize;
     let is_utf8 = flags & 0x100 != 0;
 
-    let mut offsets = Vec::with_capacity(count);
+    let count = count.min(MAX_STRINGS);
+    let mut offsets = Vec::with_capacity(count.min(1 << 16));
     for i in 0..count {
         offsets.push(u32le(buf, start + header_size + i * 4) as usize);
     }
     let base = start + strings_start;
-    let mut strings = Vec::with_capacity(count);
+    let mut strings = Vec::with_capacity(count.min(1 << 16));
     for off in offsets {
-        let mut p = base + off;
+        let mut p = base.saturating_add(off);
         if is_utf8 {
             let _len16 = read_len8(buf, &mut p);
-            let byte_len = read_len8(buf, &mut p);
-            let end = (p + byte_len).min(buf.len());
-            strings.push(String::from_utf8_lossy(&buf[p..end]).into_owned());
+            let byte_len = read_len8(buf, &mut p).min(MAX_STR_LEN);
+            match buf.get(p..p.saturating_add(byte_len)) {
+                Some(s) => strings.push(String::from_utf8_lossy(s).into_owned()),
+                None => strings.push(String::new()),
+            }
         } else {
             let mut len = u16le(buf, p) as usize;
-            p += 2;
+            p = p.saturating_add(2);
             if len & 0x8000 != 0 {
                 len = ((len & 0x7fff) << 16) | u16le(buf, p) as usize;
-                p += 2;
+                p = p.saturating_add(2);
             }
-            let mut s = String::with_capacity(len);
+            let len = len.min(MAX_STR_LEN);
+            let mut s = String::with_capacity(len.min(1 << 16));
             for i in 0..len {
                 let w = u16le(buf, p + i * 2);
                 if w == 0 {
@@ -139,10 +159,10 @@ fn read_string_pool(buf: &[u8], start: usize) -> Result<(Vec<String>, usize)> {
 }
 
 fn read_len8(buf: &[u8], p: &mut usize) -> usize {
-    let mut len = buf[*p] as usize;
+    let mut len = buf.get(*p).copied().unwrap_or(0) as usize;
     *p += 1;
     if len & 0x80 != 0 {
-        len = ((len & 0x7f) << 8) | buf[*p] as usize;
+        len = ((len & 0x7f) << 8) | buf.get(*p).copied().unwrap_or(0) as usize;
         *p += 1;
     }
     len
@@ -165,8 +185,8 @@ pub fn parse_axml(buf: &[u8]) -> Result<Node> {
     while pos + 8 <= total && pos + 8 <= buf.len() {
         let typ = u16le(buf, pos);
         let chunk_size = u32le(buf, pos + 4) as usize;
-        if chunk_size == 0 {
-            break;
+        if chunk_size < 8 {
+            break; // 0 = terminator; <8 is corrupt — stop, don't crawl
         }
         match typ {
             RES_STRING_POOL_TYPE => {
@@ -240,9 +260,13 @@ pub fn parse_axml(buf: &[u8]) -> Result<Node> {
                         ref_id,
                     });
                 }
-                // append to parent at `path`
-                append_at(&mut root, &path, node);
-                path.push(child_len_at(&root, &path) - 1);
+                // append to parent at `path`; depth-capped so recursive
+                // visitors (find_all) can't be stack-exhausted by a
+                // pathological manifest.
+                if path.len() < MAX_DEPTH {
+                    append_at(&mut root, &path, node);
+                    path.push(child_len_at(&root, &path) - 1);
+                }
             }
             RES_XML_END_ELEMENT => {
                 path.pop();
@@ -276,4 +300,30 @@ fn child_len_at(root: &Node, path: &[usize]) -> usize {
 /// First <manifest> element (helper for callers).
 pub fn manifest_root(doc: &Node) -> Option<&Node> {
     doc.children.iter().find(|c| c.name == "manifest")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn garbage_and_truncation_never_panic() {
+        for len in [0usize, 1, 4, 7, 8, 16, 64, 1024] {
+            let buf = vec![0u8; len];
+            let _ = parse_axml(&buf); // must return, not panic
+        }
+    }
+
+    #[test]
+    fn hostile_string_pool_count_no_oom() {
+        // RES_XML_TYPE header + string-pool claiming u32::MAX strings —
+        // a crafted APK must not allocate on the attacker's say-so.
+        let mut buf = vec![0u8; 64];
+        buf[0..2].copy_from_slice(&RES_XML_TYPE.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..10].copy_from_slice(&RES_STRING_POOL_TYPE.to_le_bytes());
+        buf[12..16].copy_from_slice(&56u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let _ = parse_axml(&buf);
+    }
 }

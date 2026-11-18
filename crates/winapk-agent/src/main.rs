@@ -205,10 +205,10 @@ mod plat {
     }
 
     pub fn clipboard_set(text: &str) -> (bool, String) {
-        // cmd clipboard requires Android 10+; fall back to service call.
+        // POSIX-escape quotes instead of stripping them.
+        let esc = text.replace('\'', "'\\''");
         let (ok, out) = shell(&format!(
-            "cmd clipboard set-text '{}' 2>/dev/null || service call clipboard 3 s16 '{}' i32 0",
-            text.replace('\'', ""), text.replace('\'', "")
+            "cmd clipboard set-text '{esc}' 2>/dev/null || service call clipboard 3 s16 '{esc}' i32 0",
         ));
         (ok, out)
     }
@@ -250,10 +250,34 @@ mod plat {
     }
 }
 
+/// Charset whitelist for values interpolated into guest shell commands.
+/// The control channel is reachable from any host process on 127.0.0.1 —
+/// a crafted pkg/activity/tag must not be able to inject `; rm -rf`.
+fn valid_token(s: &str, extra: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 512
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '@' | ':' | '$') || extra.contains(c))
+}
+
+fn bad(op: &str) -> AgentMsg {
+    AgentMsg::Err {
+        op: op.into(),
+        msg: "invalid characters in argument".into(),
+    }
+}
+
 fn handle(cmd: &AgentCmd) -> AgentMsg {
     match cmd {
         AgentCmd::Ping => AgentMsg::Pong { agent_version: VERSION.into() },
         AgentCmd::Start { pkg, activity, freeform } => {
+            let act_ok = activity
+                .as_deref()
+                .map(|a| valid_token(a, ""))
+                .unwrap_or(true);
+            if !valid_token(pkg, "") || !act_ok {
+                return bad("start");
+            }
             let comp = activity
                 .clone()
                 .map(|a| format!("{pkg}/{a}"))
@@ -264,11 +288,19 @@ fn handle(cmd: &AgentCmd) -> AgentMsg {
             else { AgentMsg::Err { op: "start".into(), msg: out } }
         }
         AgentCmd::Stop { pkg } => {
+            if !valid_token(pkg, "") {
+                return bad("stop");
+            }
             let (ok, out) = plat::shell(&format!("am force-stop {pkg}"));
             if ok { AgentMsg::Ok { op: "stop".into() } }
             else { AgentMsg::Err { op: "stop".into(), msg: out } }
         }
-        AgentCmd::WatchExit { pkg } => AgentMsg::Ok { op: format!("watch:{pkg}") },
+        AgentCmd::WatchExit { pkg } => {
+            if !valid_token(pkg, "") {
+                return bad("watch");
+            }
+            AgentMsg::Ok { op: format!("watch:{pkg}") }
+        }
         AgentCmd::ClipboardSet { text } => {
             let (ok, out) = plat::clipboard_set(text);
             if ok { AgentMsg::Ok { op: "clip".into() } }
@@ -278,6 +310,14 @@ fn handle(cmd: &AgentCmd) -> AgentMsg {
             op: "clip-get".into(), msg: "not implemented".into(),
         },
         AgentCmd::MountShare { tag, target } => {
+            // target is an absolute guest path — allow '/' (already in
+            // whitelist) but forbid '..' traversal components.
+            let target_ok = valid_token(target, "")
+                && target.starts_with('/')
+                && !target.split('/').any(|seg| seg == "..");
+            if !valid_token(tag, "") || !target_ok {
+                return bad("mount");
+            }
             let (ok, out) = plat::shell(&format!(
                 "mkdir -p {target} && mount -t 9p -o trans=virtio,version=9p2000.L {tag} {target}"
             ));
@@ -292,11 +332,16 @@ fn handle(cmd: &AgentCmd) -> AgentMsg {
 }
 
 fn serve<R: Read, W: Write>(r: R, mut w: W) -> std::io::Result<()> {
-    let mut reader = BufReader::new(r);
-    let mut line = String::new();
+    const MAX_LINE: u64 = 1 << 20; // a hostile client can't OOM us with
+    let mut reader = BufReader::new(r); // a gigabyte newline-less line —
+    let mut line = String::new(); // bounded reads, rest is skipped
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        let read = {
+            let mut limited = (&mut reader).take(MAX_LINE);
+            limited.read_line(&mut line)
+        };
+        match read {
             Ok(0) => {
                 // virtio-console reports EOF while NO host is attached
                 // to the chardev — the fd stays valid across reconnects,
@@ -369,5 +414,33 @@ fn main() {
                 None => std::thread::sleep(std::time::Duration::from_secs(1)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_charset_blocks_injection() {
+        assert!(valid_token("com.example.app", ""));
+        assert!(valid_token("com.x/.MainActivity", ""));
+        assert!(!valid_token("x; reboot -p", ""));
+        assert!(!valid_token("x$(id)", ""));
+        assert!(!valid_token("x`id`", ""));
+        assert!(!valid_token("a|b", ""));
+        assert!(!valid_token("", ""));
+        assert!(!valid_token(&"a".repeat(600), ""));
+    }
+
+    #[test]
+    fn mount_target_rules() {
+        let t = |s: &str| {
+            valid_token(s, "") && s.starts_with('/') && !s.split('/').any(|seg| seg == "..")
+        };
+        assert!(t("/sdcard/WINapkShare"));
+        assert!(!t("relative/path"));
+        assert!(!t("/sdcard/../data"));
+        assert!(!t("/x; reboot -p"));
     }
 }

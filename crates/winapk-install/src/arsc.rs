@@ -16,12 +16,24 @@ const TYPE_INT_DEC: u8 = 0x10;
 const TYPE_INT_HEX: u8 = 0x11;
 const TYPE_INT_BOOLEAN: u8 = 0x12;
 
+// Total readers: OOB yields 0 — crafted arsc degrades to skipped
+// chunks/empty strings instead of panicking the install path.
 fn u16le(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
+    u16::from_le_bytes(
+        b.get(o..o + 2)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 2]),
+    )
 }
 fn u32le(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    u32::from_le_bytes(
+        b.get(o..o + 4)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 4]),
+    )
 }
+
+const MAX_STRINGS: usize = 1 << 20;
 
 fn read_string_pool(buf: &[u8], start: usize) -> Vec<String> {
     let header_size = u16le(buf, start + 2) as usize;
@@ -29,25 +41,28 @@ fn read_string_pool(buf: &[u8], start: usize) -> Vec<String> {
     let flags = u32le(buf, start + 16);
     let strings_start = u32le(buf, start + 20) as usize;
     let is_utf8 = flags & 0x100 != 0;
-    let base = start + strings_start;
-    let mut out = Vec::with_capacity(count);
+    let count = count.min(MAX_STRINGS);
+    let base = start.saturating_add(strings_start);
+    let mut out = Vec::with_capacity(count.min(1 << 16));
     for i in 0..count {
-        let mut p = base + u32le(buf, start + header_size + i * 4) as usize;
+        let mut p = base.saturating_add(u32le(buf, start + header_size + i * 4) as usize);
         if p >= buf.len() {
             out.push(String::new());
             continue;
         }
         if is_utf8 {
             let _ = read_len8(buf, &mut p);
-            let bl = read_len8(buf, &mut p);
-            let end = (p + bl).min(buf.len());
-            out.push(String::from_utf8_lossy(&buf[p..end]).into_owned());
+            let bl = read_len8(buf, &mut p).min(1 << 20);
+            match buf.get(p..p.saturating_add(bl)) {
+                Some(s) => out.push(String::from_utf8_lossy(s).into_owned()),
+                None => out.push(String::new()),
+            }
         } else {
             let mut len = u16le(buf, p) as usize;
-            p += 2;
+            p = p.saturating_add(2);
             if len & 0x8000 != 0 {
                 len = ((len & 0x7fff) << 16) | u16le(buf, p) as usize;
-                p += 2;
+                p = p.saturating_add(2);
             }
             let mut s = String::new();
             for i in 0..len.min(4096) {
@@ -66,11 +81,32 @@ fn read_string_pool(buf: &[u8], start: usize) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn garbage_never_panics() {
+        for len in [0usize, 1, 8, 12, 64, 512] {
+            let buf = vec![0u8; len];
+            let _ = ResTable::parse(&buf);
+        }
+        // u32::MAX pool count inside a plausible-looking header
+        let mut buf = vec![0u8; 64];
+        buf[0..2].copy_from_slice(&RES_TABLE_TYPE.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..10].copy_from_slice(&RES_STRING_POOL_TYPE.to_le_bytes());
+        buf[12..16].copy_from_slice(&56u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let _ = ResTable::parse(&buf);
+    }
+}
+
 fn read_len8(buf: &[u8], p: &mut usize) -> usize {
-    let mut len = buf[*p] as usize;
+    let mut len = buf.get(*p).copied().unwrap_or(0) as usize;
     *p += 1;
     if len & 0x80 != 0 {
-        len = ((len & 0x7f) << 8) | buf[*p] as usize;
+        len = ((len & 0x7f) << 8) | buf.get(*p).copied().unwrap_or(0) as usize;
         *p += 1;
     }
     len
@@ -169,7 +205,7 @@ impl ResTable {
         while pos + 8 <= total && pos + 8 <= buf.len() {
             let typ = u16le(buf, pos);
             let chunk_size = u32le(buf, pos + 4) as usize;
-            if chunk_size == 0 {
+            if chunk_size < 8 {
                 break;
             }
             if typ == RES_STRING_POOL_TYPE && t.global_strings.is_empty() {
@@ -191,7 +227,7 @@ impl ResTable {
         while pos + 8 <= end && pos + 8 <= buf.len() {
             let typ = u16le(buf, pos);
             let chunk_size = u32le(buf, pos + 4) as usize;
-            if chunk_size == 0 {
+            if chunk_size < 8 {
                 break;
             }
             if typ == RES_TABLE_TYPE_TYPE {

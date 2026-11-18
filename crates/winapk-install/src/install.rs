@@ -86,7 +86,9 @@ fn expand_package(path: &Path, tmp_root: &Path) -> Result<(Vec<PathBuf>, Option<
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&out)?;
+    const MAX_EXPAND: u64 = 4 * 1024 * 1024 * 1024; // zip-bomb guard
     let mut names = Vec::new();
+    let mut total: u64 = 0;
     for i in 0..z.len() {
         let mut e = z.by_index(i).map_err(|e2| Error::Apk(format!("{e2}")))?;
         let n = e.name().to_string();
@@ -94,7 +96,21 @@ fn expand_package(path: &Path, tmp_root: &Path) -> Result<(Vec<PathBuf>, Option<
         if e.is_dir() || !n.to_ascii_lowercase().ends_with(".apk") {
             continue;
         }
-        let dest = out.join(n.rsplit('/').next().unwrap_or(&n));
+        total += e.size();
+        if total > MAX_EXPAND {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(Error::Apk(format!(
+                "{ext} expands beyond {} bytes — refusing (zip bomb guard)",
+                MAX_EXPAND
+            )));
+        }
+        // Basename only; on Windows '\' is ALSO a separator, so a
+        // crafted "a\..\evil.apk" member name could escape `out`.
+        let base = n.rsplit(['/', '\\']).next().unwrap_or(&n);
+        if base.is_empty() || base == "." || base == ".." {
+            continue;
+        }
+        let dest = out.join(base);
         let mut w = std::fs::File::create(&dest)?;
         std::io::copy(&mut e, &mut w)?;
         names.push(dest);
@@ -182,7 +198,7 @@ fn install_parts(
             .collect();
         info.libs = merge_libs(
             &std::iter::once(info.libs.clone())
-                .chain(other_maps.into_iter())
+                .chain(other_maps)
                 .collect::<Vec<_>>(),
         );
         info.abis = info.libs.keys().cloned().collect();
@@ -256,6 +272,9 @@ fn install_parts(
         None
     };
 
+    // Serialize the load→upsert→save window across CLI processes —
+    // two simultaneous installs would otherwise lost-update store.json.
+    let _store_lock = winapk_core::proc::acquire_named_mutex("Global\\WINapk-store");
     let mut store = Store::load(&paths.store_file());
     store.upsert(AppRecord {
         pkg: info.package.clone(),
