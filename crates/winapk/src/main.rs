@@ -66,7 +66,24 @@ fn open_engine() -> winapk_core::Result<(Paths, Config, Engine)> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // MSIX fileTypeAssociation / double-click invokes `winapk.exe "x.apk"`
+    // — rewrite a bare package path into the install subcommand.
+    let mut raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw.len() == 2 {
+        let arg = raw[1].to_string_lossy().to_lowercase();
+        for ext in [".apk", ".xapk", ".apks", ".apkm"] {
+            if arg.ends_with(ext) {
+                raw.insert(1, "install".into());
+                break;
+            }
+        }
+    }
+    // Start Menu tile launches with no args — show the app list
+    // instead of dying on clap's missing-subcommand error.
+    if raw.len() == 1 {
+        raw.push("list".into());
+    }
+    let cli = Cli::parse_from(raw);
     // Job keeper runs bare: no engine, no config, no mutex — just hold
     // the KILL_ON_JOB_CLOSE job until the watched emulator exits.
     if let Cmd::Vmd { pid } = cli.cmd {
@@ -122,7 +139,7 @@ fn run(cli: Cli) -> winapk_core::Result<()> {
             engine.ensure_running()?;
             engine.bind_adb()?;
             let adb = engine.adb().cloned().unwrap();
-            let exe = std::env::current_exe()?;
+            let exe = winapk_core::paths::launch_exe();
             let rep = winapk_install::install_apk(
                 &apk,
                 &adb,
@@ -213,7 +230,7 @@ fn run(cli: Cli) -> winapk_core::Result<()> {
         }
 
         Cmd::Assoc { action } => {
-            let exe = std::env::current_exe()?;
+            let exe = winapk_core::paths::launch_exe();
             match action.as_str() {
                 "on" => {
                     winapk_install::shortcut::assoc_on(&exe)?;

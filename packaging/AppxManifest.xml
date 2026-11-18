@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap uap3 uap5 rescap">
+
+  <!-- Publisher CN must match the signing cert. For real Store
+       submission Partner Center re-signs and the Publisher is set to
+       your developer account identity automatically. -->
+  <Identity Name="Cognition.WINapk"
+            Publisher="CN=WINapk Dev"
+            Version="0.1.0.0" />
+
+  <Properties>
+    <DisplayName>WINapk</DisplayName>
+    <PublisherDisplayName>Cognition</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop"
+                        MinVersion="10.0.17763.0"
+                        MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="WINapk"
+                 Executable="winapk.exe"
+                 EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="WINapk"
+                          Description="Run Android apps like native Windows programs — double-click an APK to install, launch each app in its own window."
+                          Square150x150Logo="Assets\Square150x150Logo.png"
+                          Square44x44Logo="Assets\Square44x44Logo.png"
+                          BackgroundColor="transparent">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"
+                         Square310x310Logo="Assets\Square310x310Logo.png" />
+      </uap:VisualElements>
+
+      <Extensions>
+        <!-- Double-click a package → winapk.exe "%1" (CLI rewrites it
+             to `install` automatically). -->
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="apk-packages">
+            <uap:DisplayName>Android Package</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.apk</uap:FileType>
+              <uap:FileType>.xapk</uap:FileType>
+              <uap:FileType>.apks</uap:FileType>
+              <uap:FileType>.apkm</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+
+        <!-- `winapk` usable from any shell; also the launch target
+             for generated .lnk shortcuts. -->
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="winapk.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- adb server + QEMU chardev use loopback TCP -->
+    <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+    <!-- required: spawns qemu-system / adb children, writes VM state
+         outside the package sandbox (job objects, process control) -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

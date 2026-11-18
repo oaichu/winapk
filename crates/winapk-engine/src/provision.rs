@@ -100,14 +100,14 @@ impl<'a> Provisioner<'a> {
         if !s.platform_tools {
             progress("platform-tools", 0, 0);
             let zip = self.paths.tmp_dir().join("platform-tools.zip");
-            fetch(&manifest.platform_tools, &zip)?;
+            fetch_or_bundle("platform-tools.zip", &manifest.platform_tools, &zip)?;
             extract_zip(&zip, &self.paths.runtime())?;
             let _ = fs::remove_file(&zip);
         }
         if !s.emulator {
             progress("emulator", 0, 0);
             let zip = self.paths.tmp_dir().join("emulator.zip");
-            fetch(&manifest.emulator_zip, &zip)?;
+            fetch_or_bundle("emulator.zip", &manifest.emulator_zip, &zip)?;
             // emulator-*.zip roots a top-level "emulator/" directory.
             extract_zip(&zip, &self.paths.runtime())?;
             let _ = fs::remove_file(&zip);
@@ -120,7 +120,7 @@ impl<'a> Provisioner<'a> {
         if !s.sysimg {
             progress("system-image", 0, 0);
             let zip = self.paths.tmp_dir().join("sysimg.zip");
-            fetch(&manifest.sysimg_zip, &zip)?;
+            fetch_or_bundle("sysimg.zip", &manifest.sysimg_zip, &zip)?;
             // The zip wraps a top-level dir (x86_64/) — extract to tmp,
             // then move the dir containing system.img into place.
             let tmp = self.paths.tmp_dir().join("sysimg-extract");
@@ -142,7 +142,7 @@ impl<'a> Provisioner<'a> {
         // AEHD is best-effort: WHPX is the fallback accelerator.
         let aehd_zip = self.paths.tmp_dir().join("aehd.zip");
         if !self.paths.aehd_dir().join("gvm.dll").exists() {
-            if fetch(&manifest.aehd, &aehd_zip).is_ok() {
+            if fetch_or_bundle("aehd.zip", &manifest.aehd, &aehd_zip).is_ok() {
                 let _ = extract_zip(&aehd_zip, &self.paths.aehd_dir());
             }
             let _ = fs::remove_file(&aehd_zip);
@@ -206,6 +206,24 @@ fn fetch_text(url: &str, timeout: Duration) -> Result<String> {
 fn fetch(url: &str, dest: &Path) -> Result<()> {
     info!("download {url}");
     proc::curl_download(url, dest, Duration::from_secs(60 * 30))
+}
+
+/// MSIX package ships the runtime zips under `<exe>/bundle/` — Store
+/// policy frowns on downloading executables post-install, so when a
+/// bundled copy exists it wins over the network fetch.
+fn bundle_zip(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.parent()?.join("bundle").join(name);
+    p.exists().then_some(p)
+}
+
+fn fetch_or_bundle(name: &str, url: &str, dest: &Path) -> Result<()> {
+    if let Some(b) = bundle_zip(name) {
+        info!("bundled runtime: {}", b.display());
+        fs::copy(&b, dest).map_err(Error::Io)?;
+        return Ok(());
+    }
+    fetch(url, dest)
 }
 
 fn abs(base: &str, rel_or_abs: &str) -> String {

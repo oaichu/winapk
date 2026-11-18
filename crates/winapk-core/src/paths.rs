@@ -138,3 +138,25 @@ impl Paths {
         Ok(())
     }
 }
+
+/// What shortcuts / file associations should point at.
+/// Under MSIX the real exe lives in `Program Files\WindowsApps\...` —
+/// that path cannot be launched directly (ACL'd, needs package
+/// identity), so route through the AppExecutionAlias shim.
+pub fn launch_exe() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.to_string_lossy().to_lowercase().contains("\\windowsapps\\") {
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                let alias = Path::new(&local)
+                    .join("Microsoft")
+                    .join("WindowsApps")
+                    .join("winapk.exe");
+                if alias.exists() {
+                    return alias;
+                }
+            }
+        }
+        return exe;
+    }
+    PathBuf::from("winapk.exe")
+}
