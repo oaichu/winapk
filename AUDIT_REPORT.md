@@ -82,4 +82,4 @@ Unused dependencies: không phát hiện (tất cả deps trong 7 Cargo.toml đ�
 - **Lint:** `cargo clippy --all-targets` PASS (0 warnings — trước ~21)
 - **Tests:** 17/17 PASS (5 existing ABI + 12 mới: parser fuzz-lite, safe_rel, sq, valid_token, mount rules)
 - **Cross-target:** `x86_64-unknown-linux-musl` agent check PASS
-- **Not verified live:** các fix path (virtio persistent reader, adopt serial-pin, stop sweep) chưa chạy VM thật lần này — cần một phiên boot regression trước khi merge.
+- **Live regression (2026-11-18, post-fix):** PASS — cold boot→`run` qua virtio-serial agent (persistent reader) → window attached; process khác `doctor`/`share` adopt đúng `emulator-5554` qua cmdline `-port` pin; `share pull` batch-stat chạy sạch; `stop` (adopted-path) dọn 0 process sót. Fallback `adb` khi chardev đã bị session đầu giữ — đúng thiết kế (single-connection).
