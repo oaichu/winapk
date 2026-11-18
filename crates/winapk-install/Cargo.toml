@@ -11,5 +11,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 zip.workspace = true
+image.workspace = true
 winreg.workspace = true
 windows = { workspace = true }

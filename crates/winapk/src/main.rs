@@ -51,6 +51,10 @@ enum Cmd {
     },
     /// Inspect an APK without installing (manifest, label, icon, ABIs).
     Inspect { apk: PathBuf },
+    /// INTERNAL: detached job-keeper — wraps the emulator pid in a
+    /// KILL_ON_JOB_CLOSE job and exits when the VM does.
+    #[command(name = "__vmd", hide = true)]
+    Vmd { pid: u32 },
 }
 
 fn open_engine() -> winapk_core::Result<(Paths, Config, Engine)> {
@@ -63,6 +67,11 @@ fn open_engine() -> winapk_core::Result<(Paths, Config, Engine)> {
 
 fn main() {
     let cli = Cli::parse();
+    // Job keeper runs bare: no engine, no config, no mutex — just hold
+    // the KILL_ON_JOB_CLOSE job until the watched emulator exits.
+    if let Cmd::Vmd { pid } = cli.cmd {
+        std::process::exit(winapk_core::proc::job_keepalive(pid));
+    }
     let code = match run(cli) {
         Ok(()) => 0,
         Err(e) => {
@@ -257,6 +266,8 @@ fn run(cli: Cli) -> winapk_core::Result<()> {
                 }
             }
         }
+
+        Cmd::Vmd { .. } => {} // handled in main() before run()
     }
     Ok(())
 }

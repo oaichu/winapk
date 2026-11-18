@@ -142,6 +142,38 @@ impl Adb {
         None
     }
 
+    /// `adb push` a local file into the guest.
+    pub fn push(&self, local: &Path, remote: &str, timeout: Duration) -> Result<()> {
+        self.run(
+            &["push", &local.to_string_lossy(), remote],
+            timeout,
+        )?;
+        Ok(())
+    }
+
+    /// `adb forward tcp:h tcp:g` — host loopback → guest loopback.
+    pub fn forward(&self, host_port: u16, guest_port: u16) -> Result<()> {
+        self.run(
+            &[
+                "forward",
+                &format!("tcp:{host_port}"),
+                &format!("tcp:{guest_port}"),
+            ],
+            Duration::from_secs(15),
+        )?;
+        Ok(())
+    }
+
+    /// Spawn a detached background process inside the guest. Returns
+    /// immediately — adbd doesn't reap children, and nohup+setsid keeps
+    /// it alive across adb disconnects and shell exit.
+    pub fn spawn_detached(&self, cmd: &str) {
+        let _ = self.try_shell(
+            &format!("setsid nohup {cmd} </dev/null >/data/local/tmp/winapk-agent.log 2>&1 &"),
+            Duration::from_secs(8),
+        );
+    }
+
     /// Block until the device appears, then until boot completes.
     pub fn wait_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
@@ -184,6 +216,33 @@ impl Adb {
             Ok(())
         } else {
             Err(Error::Adb(format!("install failed: {out}")))
+        }
+    }
+
+    /// `adb install-multiple` for split packages (.xapk/.apks/.apkm):
+    /// one session across base + config splits. `apks[0]` should be the
+    /// base for readability though adb doesn't require ordering.
+    pub fn install_multiple(
+        &self,
+        apks: &[PathBuf],
+        abi: Option<&str>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let mut args: Vec<String> =
+            vec!["install-multiple".into(), "-r".into(), "-g".into()];
+        if let Some(a) = abi {
+            args.push("--abi".into());
+            args.push(a.into());
+        }
+        for p in apks {
+            args.push(p.to_string_lossy().into());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run(&refs, timeout)?;
+        if out.contains("Success") {
+            Ok(())
+        } else {
+            Err(Error::Adb(format!("install-multiple failed: {out}")))
         }
     }
 

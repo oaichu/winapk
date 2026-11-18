@@ -100,6 +100,30 @@ impl Paths {
         self.root.join("bin").join("winapk-display-host.exe")
     }
 
+    /// linux-musl static agent pushed to the guest. Search order:
+    ///   1. <winapk.exe dir>/winapk-agent          (installed layout)
+    ///   2. $WINAPK_HOME/bin/winapk-agent          (user drop-in)
+    ///   3. workspace target/…/winapk-agent        (dev build)
+    pub fn agent_bin(&self) -> Option<PathBuf> {
+        let mut cands: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(d) = exe.parent() {
+                cands.push(d.join("winapk-agent"));
+                // dev: target/debug/winapk.exe → target/<musl>/<profile>/
+                // (release first — 650KB stripped beats 8MB debug on push)
+                for prof in ["release", "debug"] {
+                    cands.push(
+                        d.join(format!(
+                            "../x86_64-unknown-linux-musl/{prof}/winapk-agent"
+                        )),
+                    );
+                }
+            }
+        }
+        cands.push(self.root.join("bin").join("winapk-agent"));
+        cands.into_iter().find(|p| p.exists())
+    }
+
     pub fn ensure_all(&self) -> std::io::Result<()> {
         for d in [
             self.runtime(),

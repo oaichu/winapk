@@ -137,3 +137,122 @@ pub fn curl_download(url: &str, dest: &std::path::Path, timeout: Duration) -> Re
 pub fn stdout_string(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
+
+/// A Windows Job Object configured JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+/// emulator.exe re-execs and detaches its real qemu-system child, so
+/// neither Child::kill nor taskkill /T reliably covers it — but every
+/// process in the tree belongs to this job, and the kernel kills the
+/// whole job when the last handle closes (including on our crash).
+#[cfg(windows)]
+pub struct JobHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl JobHandle {
+    /// Create a job and assign `pid` (and thus its whole future tree).
+    /// Returns None when the process already lives in another job —
+    /// callers must keep the cmdline sweep as a fallback.
+    pub fn wrap(pid: u32) -> Option<Self> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::JobObjects::*;
+        use windows::Win32::System::Threading::*;
+        unsafe {
+            let job = CreateJobObjectW(None, None).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            )
+            .is_err()
+            {
+                let _ = CloseHandle(job);
+                return None;
+            }
+            let proc = OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                false,
+                pid,
+            )
+            .ok()?;
+            let assigned = AssignProcessToJobObject(job, proc);
+            let _ = CloseHandle(proc);
+            if assigned.is_err() {
+                let _ = CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// A named system mutex guarding boot/adopt/stop across *processes* —
+/// two simultaneous `winapk.exe` invocations (e.g. two .lnk clicks)
+/// would otherwise race the AVD files exactly like apkstart's
+/// engine.js did. WAIT_ABANDONED still transfers ownership, so a
+/// crashed holder can never wedge the lock.
+#[cfg(windows)]
+pub struct MutexGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+pub fn acquire_named_mutex(name: &str) -> Option<MutexGuard> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    let wide: Vec<u16> = std::ffi::OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let m = CreateMutexW(None, false, windows::core::PCWSTR(wide.as_ptr())).ok()?;
+        match WaitForSingleObject(m, u32::MAX) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(MutexGuard(m)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MutexGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn acquire_named_mutex(_name: &str) -> Option<()> {
+    None
+}
+
+/// __vmd keeper body: wrap `pid`'s tree in a kill-on-close job, then
+/// block until the watched process exits. Our exit closes the job
+/// handle → the kernel reaps any still-running descendants.
+#[cfg(windows)]
+pub fn job_keepalive(pid: u32) -> i32 {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+    };
+    const SYNCHRONIZE: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
+    let _job = JobHandle::wrap(pid); // None = sweep stays fallback
+    unsafe {
+        if let Ok(h) = OpenProcess(SYNCHRONIZE, false, pid) {
+            let _ = WaitForSingleObject(h, u32::MAX);
+            let _ = CloseHandle(h);
+        }
+    }
+    0
+}

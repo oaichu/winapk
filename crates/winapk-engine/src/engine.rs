@@ -314,6 +314,7 @@ impl Engine {
                 // The VM may have been started before our tuning existed —
                 // apply it on adopt too.
                 self.tune_process(pid);
+                self.deploy_agent();
                 return Ok(true);
             }
         }
@@ -416,8 +417,25 @@ impl Engine {
         let _ = std::fs::write(self.paths.root().join("emulator.pid"), pid.to_string());
         self.child = Some(child);
         self.serial = format!("emulator-{port}");
+        self.spawn_job_keeper(pid);
         self.spawn_auth_guard();
         Ok(pid)
+    }
+
+    /// The CLI exits long before the VM does, so the Job Object must be
+    /// owned by a process that shares the VM's lifetime: a detached
+    /// `winapk __vmd <pid>` keeper wraps the emulator pid in a
+    /// KILL_ON_JOB_CLOSE job and blocks until the VM exits. Keeper dies
+    /// → job closes → whole QEMU tree dies (no orphans, ever). VM dies
+    /// → keeper exits. The future winapkd absorbs this role directly.
+    fn spawn_job_keeper(&self, pid: u32) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let mut c = std::process::Command::new(exe);
+        c.arg("__vmd").arg(pid.to_string());
+        match proc::spawn_quiet(&mut c) {
+            Ok(_) => info!("job-keeper __vmd watching pid {pid}"),
+            Err(e) => warn!("job keeper spawn failed (orphan sweep remains): {e}"),
+        }
     }
 
     /// Background guard: while this VM lives, if adb reports the device
@@ -499,6 +517,11 @@ impl Engine {
     /// GPU fallback chain: preferred mode, then next in chain on boot
     /// failure (child died early) — swiftshader is last-resort only.
     pub fn ensure_running(&mut self) -> Result<()> {
+        // Cross-process serialization: a second winapk.exe blocks here
+        // instead of racing our provision/adopt/boot writes. The guard
+        // is held for the whole call — the loser re-runs ensure_running
+        // afterwards and simply adopts the now-live VM.
+        let _vm_lock = proc::acquire_named_mutex("Global\\WINapk-vm");
         self.ensure_provisioned(|_, _, _| {})?;
         // Reattach to a VM an earlier CLI invocation already booted —
         // BEFORE ensure_avd: adoption must not be blocked by userdata
@@ -650,7 +673,14 @@ impl Engine {
                     info!("Android ready on {}", self.serial);
                     let adb2 = self.adb_client()?;
                     adb2.enable_freeform();
+                    self.deploy_agent();
                     self.channel = Some(self.open_channel());
+                    // vCPU/render threads only exist AFTER boot —
+                    // pinning at CreateProcess hit nothing. Re-pin now
+                    // against the real qemu-system process tree.
+                    if let Some(pid) = self.emulator_pid() {
+                        tuning::repin_guest_threads(pid);
+                    }
                     return Ok(());
                 }
                 Err(Error::Timeout(_)) => {
@@ -693,6 +723,51 @@ impl Engine {
                 Duration::from_secs(30),
             );
         });
+    }
+
+    /// Push the musl-static agent to /data/local/tmp (idempotent — size
+    /// check skips re-push), relaunch it detached. Runs as `su 0` on
+    /// userdebug images (shell context on user builds). The agent owns
+    /// the virtio-serial port; once it's up, open_channel()'s ping
+    /// upgrades us off the adb fallback automatically.
+    fn deploy_agent(&self) {
+        const DEST: &str = "/data/local/tmp/winapk-agent";
+        let Some(local) = self.paths.agent_bin() else {
+            info!("no winapk-agent binary found — adb channel only");
+            return;
+        };
+        let Ok(adb) = self.adb_client() else { return };
+        let local_len = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+        let (_, size) = adb.try_shell(
+            &format!("stat -c %s {DEST} 2>/dev/null || echo 0"),
+            Duration::from_secs(5),
+        );
+        let remote_len: u64 = size.trim().parse().unwrap_or(0);
+        if remote_len != local_len {
+            info!("deploying agent to {DEST} ({local_len} bytes)");
+            if adb.push(&local, DEST, Duration::from_secs(120)).is_err() {
+                warn!("agent push failed");
+                return;
+            }
+            let _ = adb.try_shell(&format!("chmod 755 {DEST}"), Duration::from_secs(5));
+        }
+        // Restart idempotently; root when the image gives it to us.
+        // NOTE: kill by pidof, never `pkill -f` — the -f pattern matches
+        // the adb shell's own cmdline and SIGTERMs our own session.
+        let (ok, uid) = adb.try_shell("su 0 id -u", Duration::from_secs(5));
+        let root = ok && uid.trim() == "0";
+        let kill = if root {
+            "su 0 kill $(pidof winapk-agent) 2>/dev/null"
+        } else {
+            "kill $(pidof winapk-agent) 2>/dev/null"
+        };
+        let _ = adb.try_shell(kill, Duration::from_secs(5));
+        let cmd = if root {
+            format!("su 0 {DEST}")
+        } else {
+            DEST.to_string()
+        };
+        adb.spawn_detached(&cmd);
     }
 
     fn adb_client(&self) -> Result<Adb> {
@@ -774,6 +849,9 @@ impl Engine {
 
     /// Graceful stop: ask agent/emulator to power off, escalate to taskkill.
     pub fn stop(&mut self) -> Result<()> {
+        // Same named mutex as ensure_running — stop can't interleave
+        // with another process's adopt/boot.
+        let _vm_lock = proc::acquire_named_mutex("Global\\WINapk-vm");
         // Adopt a VM started by a previous CLI run, so `winapk stop` works.
         if self.child.is_none() {
             let _ = self.adopt_running();

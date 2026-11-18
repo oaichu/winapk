@@ -1,7 +1,6 @@
 //! APK inspection: open the zip, parse AndroidManifest.xml (binary),
 //! resolve label/icon through resources.arsc, enumerate native ABIs.
 
-use std::collections::HashSet;
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -21,6 +20,12 @@ pub struct ApkInfo {
     pub launcher: Option<String>,
     /// Native ABIs shipped under lib/ — drives `adb install --abi`.
     pub abis: Vec<String>,
+    /// abi → sorted basenames of the .so files it ships. Drives the
+    /// mixed-ABI check: x86_64 must COVER arm64's set or we force
+    /// `--abi arm64-v8a` so translation handles the whole app.
+    pub libs: std::collections::BTreeMap<String, Vec<String>>,
+    /// manifest `split` attr — non-base members of a split package.
+    pub split: Option<String>,
     /// Zip entry name of the best-density raster icon, if any.
     pub icon_entry: Option<String>,
     pub min_sdk: Option<i64>,
@@ -113,21 +118,35 @@ pub fn analyze(apk: &Path) -> Result<ApkInfo> {
         icon_entry = guess_icon_entry(&mut z);
     }
 
-    let mut abis: Vec<String> = {
-        let mut set = HashSet::new();
-        for n in z.file_names() {
-            let mut it = n.split('/');
-            if it.next() == Some("lib") {
-                if let Some(abi) = it.next() {
-                    if it.next().is_some() {
-                        set.insert(abi.to_string());
-                    }
+    let mut libs: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for n in z.file_names() {
+        let mut it = n.split('/');
+        if it.next() == Some("lib") {
+            if let (Some(abi), Some(name)) = (it.next(), it.next()) {
+                if !name.is_empty() {
+                    libs.entry(abi.to_string())
+                        .or_default()
+                        .push(name.to_string());
                 }
             }
         }
-        set.into_iter().collect()
-    };
+    }
+    for v in libs.values_mut() {
+        v.sort();
+    }
+    let mut abis: Vec<String> = libs.keys().cloned().collect();
     abis.sort();
+
+    // <manifest split="foo"> marks a non-base split member.
+    let split = m
+        .attrs
+        .iter()
+        .find(|a| a.name == "split" && a.ns.is_empty())
+        .and_then(|a| match &a.value {
+            Some(AttrValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        });
 
     let extract_native_libs = app
         .and_then(|a| a.attr_value("extractNativeLibs").cloned())
@@ -149,10 +168,36 @@ pub fn analyze(apk: &Path) -> Result<ApkInfo> {
         label,
         launcher,
         abis,
+        libs,
+        split,
         icon_entry,
         min_sdk,
         extract_native_libs,
     })
+}
+
+/// Union the lib maps of several component APKs (base + abi splits) —
+/// for .xapk/.apks bundles the x86_64/arm64 payloads live in separate
+/// config splits, so the coverage check must see the merged set.
+pub fn merge_libs(
+    maps: &[std::collections::BTreeMap<String, Vec<String>>],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        Default::default();
+    for m in maps {
+        for (abi, names) in m {
+            let e = out.entry(abi.clone()).or_default();
+            for n in names {
+                if !e.contains(n) {
+                    e.push(n.clone());
+                }
+            }
+        }
+    }
+    for v in out.values_mut() {
+        v.sort();
+    }
+    out
 }
 
 /// ".MainActivity" → "pkg/.MainActivity"; "com.x.A" → "pkg/com.x.A".

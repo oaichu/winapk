@@ -39,6 +39,105 @@ pub fn is_png(b: &[u8]) -> bool {
     b.len() > 8 && &b[..8] == b"\x89PNG\r\n\x1a\n"
 }
 
+fn is_binary_xml(b: &[u8]) -> bool {
+    // AXML magic: 0x03 0x00 0x08 0x00
+    b.len() > 4 && b[0] == 0x03 && b[1] == 0x00 && b[2] == 0x08 && b[3] == 0x00
+}
+
+/// Decode any raster (PNG/WebP) into PNG bytes.
+fn raster_to_png(b: &[u8]) -> Option<Vec<u8>> {
+    if is_png(b) {
+        return Some(b.to_vec());
+    }
+    let img = image::load_from_memory(b).ok()?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// Android 8+ adaptive icons: res/*.xml (binary AXML) with
+/// <adaptive-icon><background android:drawable="@ref"/><foreground …/>
+/// Composite bg+fg onto a 256px canvas — the assets are drawn full-bleed
+/// (108dp) so a straight overlay is the correct flatten.
+fn adaptive_to_png(apk_path: &Path, xml: &[u8]) -> Option<Vec<u8>> {
+    use crate::arsc::{ResTable, ResValue};
+    use crate::axml::{self, AttrValue};
+
+    let doc = axml::parse_axml(xml).ok()?;
+    // parse_axml hands back a synthetic root — the real element is its
+    // single child (<adaptive-icon>).
+    let root = if doc.name == "adaptive-icon" {
+        &doc
+    } else {
+        doc.children
+            .iter()
+            .find(|n| n.name == "adaptive-icon")?
+    };
+    // resource table for @ref resolution
+    let arsc = crate::apk::entry_bytes(apk_path, "resources.arsc").ok()?;
+    let table = ResTable::parse(&arsc).ok()?;
+
+    let mut layers: Vec<Vec<u8>> = Vec::new();
+    for layer in ["background", "foreground"] {
+        for ch in &root.children {
+            if ch.name != layer {
+                continue;
+            }
+            let path = ch
+                .attr("drawable")
+                .and_then(|a| a.ref_id)
+                .and_then(|r| table.resolve(r, true, 0))
+                .and_then(|v| match v {
+                    ResValue::Str(s) => Some(s),
+                    _ => None,
+                })
+                .or_else(|| match ch.attr_value("drawable") {
+                    Some(AttrValue::Str(s)) => Some(s.clone()),
+                    _ => None,
+                });
+            let Some(p) = path.filter(|p| p.starts_with("res/")) else {
+                continue;
+            };
+            if let Ok(b) = crate::apk::entry_bytes(apk_path, &p) {
+                if let Some(png) = raster_to_png(&b) {
+                    layers.push(png);
+                }
+            }
+        }
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    const SZ: u32 = 256;
+    let mut canvas = image::RgbaImage::from_pixel(SZ, SZ, image::Rgba([0, 0, 0, 0]));
+    for l in layers {
+        let img = image::load_from_memory(&l).ok()?.to_rgba8();
+        let img = image::imageops::resize(
+            &img,
+            SZ,
+            SZ,
+            image::imageops::FilterType::Triangle,
+        );
+        image::imageops::overlay(&mut canvas, &img, 0, 0);
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(canvas)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .ok()?;
+    Some(out.into_inner())
+}
+
+/// Resolve an icon entry to PNG bytes: PNG verbatim, WebP decoded,
+/// adaptive-XML composited. None → caller uses the flat fallback.
+fn load_icon_png(apk_path: &Path, entry: &str) -> Option<Vec<u8>> {
+    let b = crate::apk::entry_bytes(apk_path, entry).ok()?;
+    if is_binary_xml(&b) || entry.ends_with(".xml") {
+        adaptive_to_png(apk_path, &b)
+    } else {
+        raster_to_png(&b)
+    }
+}
+
 /// Deterministic flat-color ICO (32×32 BMP) derived from the package name,
 /// for apps whose icon isn't a raster (adaptive XML/webp).
 pub fn fallback_ico(pkg: &str) -> Vec<u8> {
@@ -91,8 +190,7 @@ pub fn fallback_ico(pkg: &str) -> Vec<u8> {
 /// Build the .ico for a package from its best raster entry (or fallback).
 pub fn write_ico(apk_path: &Path, entry: Option<&str>, pkg: &str, dest: &Path) -> Result<()> {
     let bytes = entry
-        .and_then(|e| crate::apk::entry_bytes(apk_path, e).ok())
-        .filter(|b| is_png(b))
+        .and_then(|e| load_icon_png(apk_path, e))
         .map(|png| png_to_ico(&png))
         .transpose()?
         .unwrap_or_else(|| fallback_ico(pkg));
