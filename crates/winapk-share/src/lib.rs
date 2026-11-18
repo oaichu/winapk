@@ -127,19 +127,25 @@ pub fn push(adb: &Adb, paths: &Paths) -> Result<usize> {
     Ok(pushed)
 }
 
-/// Pull guest → host. Guest file list via `find` + per-file `adb pull`
-/// only when size/mtime differs.
+/// Pull guest → host. ONE `find -exec stat` gives size+mtime for the
+/// whole tree (was: a separate `stat` adb round-trip per file — ~200ms
+/// each on a cold shell). Pull only what differs.
 pub fn pull(adb: &Adb, paths: &Paths) -> Result<usize> {
     let dir = paths.share_dir();
     std::fs::create_dir_all(&dir)?;
-    // toybox `find` has no -printf; list names, then `stat -c %s` per file.
+    // Lines come back as "<size> <mtime> <name>"; names may contain
+    // spaces, so only split twice.
     let (_, out) = adb.try_shell(
-        &format!("cd {GUEST_DIR} && find . -type f"),
-        Duration::from_secs(20),
+        &format!("cd {GUEST_DIR} && find . -type f -exec stat -c '%s %Y %n' {{}} +"),
+        Duration::from_secs(30),
     );
     let mut got = 0usize;
     for line in out.lines() {
-        let rel = line.trim().trim_start_matches("./");
+        let mut parts = line.splitn(3, ' ');
+        let sz: u64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let mt: u64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let Some(name) = parts.next() else { continue };
+        let rel = name.trim().trim_start_matches("./");
         let Some(rel_path) = safe_rel(rel) else {
             if !rel.is_empty() {
                 warn!("share pull: skipping unsafe guest path {rel:?}");
@@ -163,9 +169,17 @@ pub fn pull(adb: &Adb, paths: &Paths) -> Result<usize> {
             continue;
         }
         let remote = format!("{GUEST_DIR}/{rel}");
-        let (_, sz) = adb.try_shell(&format!("stat -c %s {}", sq(&remote)), Duration::from_secs(10));
-        let sz: u64 = sz.trim().parse().unwrap_or(0);
-        let stale = dest.metadata().map(|m| m.len() != sz).unwrap_or(true);
+        let stale = match dest.metadata() {
+            Ok(m) => {
+                m.len() != sz
+                    || m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() != mt)
+                        .unwrap_or(true)
+            }
+            Err(_) => true,
+        };
         if !stale {
             continue;
         }

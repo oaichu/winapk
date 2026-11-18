@@ -87,7 +87,6 @@ pub fn create(paths: &Paths, profile: &EngineProfile, sysimg: &Path) -> Result<(
     put("hw.gps", "yes");
     put("hw.gsmModem", "yes");
     put("hw.sensors.light", "yes");
-    put("hw.sensors.orientation", "yes");
     put("hw.sensors.proximity", "yes");
     put("hw.trackBall", "no");
     put("hw.device.manufacturer", "Google");

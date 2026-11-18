@@ -23,11 +23,25 @@ pub struct Store {
 }
 
 impl Store {
+    /// Corrupt file → rename to .bak (preserve evidence) and start
+    /// fresh — a silent default would make the user's apps "vanish"
+    /// with no trace of why.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(path) {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(store) => store,
+                Err(e) => {
+                    let bak = path.with_extension("json.bak");
+                    let _ = std::fs::rename(path, &bak);
+                    winapk_core::warn!(
+                        "store.json corrupt ({e}) — moved to {}",
+                        bak.display()
+                    );
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
     }
 
     /// Atomic save: tmp+rename so a crash mid-write can't leave a
